@@ -1,0 +1,145 @@
+// defaults_tests — the default methods the traits carry, run against
+// test doubles on the host.
+//
+// Five methods have a default body: `GpioOut.toggle`,
+// `UartTx.write_bytes`, `I2cBus.write_reg`, `I2cBus.read_reg` and
+// `Adc.read_mv`.  Each double implements only the methods its trait
+// requires.  The rest of the package is declarations, which have no
+// lines to run.
+//
+// A trait method's receiver is a plain `self`, so a double cannot
+// record its calls in a list of its own.  The GPIO and UART doubles
+// instead panic when they receive the one call a test names (`trip`),
+// and `test.assert_raises` passes only if that call was made.  The I2C
+// and ADC defaults return a value, which the tests read directly.
+
+use std.test
+use embedded_hal.{ GpioOut, UartTx, I2cBus, Adc }
+
+// ── GPIO ─────────────────────────────────────────────────────────────
+
+// A pin whose input reads `level`.  A write of `val` to `pin` panics
+// when pin * 10 + val equals `trip`.
+struct TripPins
+    level: Int
+    trip: Int
+
+impl GpioOut for TripPins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        if 100 + dir == self.trip
+            panic.panic("mode")
+
+    fn set(self, pin: Int, val: Int) [hw]
+        if pin * 10 + val == self.trip
+            panic.panic("set")
+
+    fn get(self, pin: Int) -> Int [hw]
+        self.level
+
+@test
+fn test_toggle_of_a_low_pin_writes_high() [io, hw]
+    test.assert_raises(() => TripPins { level: 0, trip: 31 }.toggle(3))
+    // The same pin does not write low, so this call returns.
+    TripPins { level: 0, trip: 30 }.toggle(3)
+
+@test
+fn test_toggle_of_a_high_pin_writes_low() [io, hw]
+    test.assert_raises(() => TripPins { level: 1, trip: 30 }.toggle(3))
+    TripPins { level: 1, trip: 31 }.toggle(3)
+
+@test
+fn test_an_implementation_s_own_methods_are_called_directly() [io, hw]
+    test.assert_raises(() => TripPins { level: 0, trip: 101 }.mode(5, 1))
+    test.assert_raises(() => TripPins { level: 0, trip: 51 }.set(5, 1))
+    test.assert(TripPins { level: 1, trip: 0 }.get(5) == 1)
+
+// ── UART ─────────────────────────────────────────────────────────────
+
+// A transmitter that panics when it is asked to write `trip`, or to
+// start at the baud rate `trip`.
+struct TripTx
+    trip: Int
+
+impl UartTx for TripTx
+    fn init(self, baud: Int) [hw]
+        if baud == self.trip
+            panic.panic("init")
+
+    fn write_byte(self, b: Int) [hw]
+        if b == self.trip
+            panic.panic("write_byte")
+
+@test
+fn test_write_bytes_writes_every_byte() [io, hw]
+    test.assert_raises(() => TripTx { trip: 104 }.write_bytes([104 as u8, 105 as u8, 10 as u8]))
+    test.assert_raises(() => TripTx { trip: 105 }.write_bytes([104 as u8, 105 as u8, 10 as u8]))
+    test.assert_raises(() => TripTx { trip: 10 }.write_bytes([104 as u8, 105 as u8, 10 as u8]))
+    // A byte that is not in the buffer is never written.
+    TripTx { trip: 7 }.write_bytes([104 as u8, 105 as u8, 10 as u8])
+
+@test
+fn test_write_bytes_of_nothing_writes_nothing() [io, hw]
+    TripTx { trip: 0 }.write_bytes([])
+
+@test
+fn test_init_is_the_implementation_s() [io, hw]
+    test.assert_raises(() => TripTx { trip: 115200 }.init(115200))
+
+// ── I2C ──────────────────────────────────────────────────────────────
+
+// A bus with one device, at address 0x48.  A write is acknowledged when
+// it reaches that device and is two bytes long; every register reads
+// `value`.
+struct FakeBus
+    value: Int
+
+impl I2cBus for FakeBus
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        addr == 0x48 and list.len(data) == 2
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != 0x48 or list.len(tx) != 1
+            return None
+        Some([(self.value + tx[0] as Int) as u8])
+
+@test
+fn test_write_reg_sends_the_register_and_the_value() [io, hw]
+    test.assert(FakeBus { value: 0 }.write_reg(0x48, 0x01, 0x60))
+
+@test
+fn test_write_reg_to_an_absent_device_is_not_acknowledged() [io, hw]
+    test.assert(not FakeBus { value: 0 }.write_reg(0x50, 0x01, 0x60))
+
+@test
+fn test_read_reg_answers_the_register_s_byte() [io, hw]
+    let bus = FakeBus { value: 0x28 }
+    // The double answers value + register, so the register reached it.
+    test.assert(bus.read_reg(0x48, 0x02) == Some(42))
+
+@test
+fn test_read_reg_of_an_absent_device_is_none() [io, hw]
+    let bus = FakeBus { value: 0x2A }
+    test.assert(bus.read_reg(0x50, 0x00) == None)
+    test.assert(bus.read(0x48, 1) == None)
+    bus.init(400000)
+
+// ── ADC ──────────────────────────────────────────────────────────────
+
+struct FakeAdc
+    count: Int
+
+impl Adc for FakeAdc
+    fn read_raw(self, channel: Int) -> Int [hw]
+        self.count
+
+@test
+fn test_read_mv_scales_a_12_bit_count_to_3300_mv() [io, hw]
+    test.assert(FakeAdc { count: 0 }.read_mv(0) == 0)
+    test.assert(FakeAdc { count: 2048 }.read_mv(0) == 1650)
+    test.assert(FakeAdc { count: 4095 }.read_mv(0) == 3299)

@@ -1,0 +1,337 @@
+// embedded_hal — the peripheral traits a device program is written
+// against, and the handles a board implements them for.
+//
+// A program that writes `use embedded_hal` names a peripheral by its
+// handle (`BoardGpio`, `BoardUart`, `BoardTimer`) and calls it through
+// the traits below.  The board the program is built for supplies the
+// implementations: the board's package holds an `impl` of each trait
+// it can satisfy for each handle, beside its `bsp` declaration, and the
+// build adds that package when the program uses this module.  The same
+// source therefore builds for every board that implements the traits
+// it calls, and the image carries only the methods it calls.
+//
+// Most peripheral kinds have two traits, a sync one and an async one.
+// A bit-banged software UART can only offer the sync trait; a
+// DMA-backed peripheral can offer both.  The split lets an
+// implementation declare what the hardware supports rather than fake
+// the other half.  The pairing follows Rust's `embedded-hal` and
+// `embedded-hal-async`.
+//
+// The traits spelled with `async fn` work on the host scheduler and are
+// refused at `@tier(embedded)` (E4002): spawned, an `async fn`
+// allocates a state struct per spawn, and called directly it has its
+// awaits erased and suspends nowhere.  For a device, the awaitable
+// traits at the end of this file return the Future a peripheral's
+// interrupt resolves, and the caller awaits that handle.
+//
+// Every sync method and every `async fn` declares `[hw]`.  The
+// awaitable traits take an effect parameter instead (SPEC § 5.6), so a
+// memory-backed test source is charged nothing and a peripheral is
+// charged `[hw]`.
+
+use core.rt
+
+// ── The board's peripherals ──────────────────────────────────────────
+//
+// A handle names one instance of a peripheral on the board the program
+// is built for.  It holds no state of its own: the state is in the
+// peripheral's registers, so a handle is an `Int` in a frame and
+// building one allocates nothing.  `id` selects the instance, 0 for the
+// first; a board with one instance of a peripheral answers for 0 and
+// documents what it does with any other number.
+
+// The board's general-purpose I/O.  `id` is the port.
+pub @value
+struct BoardGpio
+    id: Int
+
+// A serial port on the board.  `id` is the port number; 0 is the one
+// the board's documentation names as its console.
+pub @value
+struct BoardUart
+    id: Int
+
+// A timer on the board.  `id` selects the timer; 0 is the one the
+// board uses for its delays and its tick count.
+pub @value
+struct BoardTimer
+    id: Int
+
+// ── GPIO ─────────────────────────────────────────────────────────────
+
+// A GPIO port, driven one pin at a time.  One trait covers both
+// directions, since input and output are the same registers.  `mode`'s
+// `dir` selects:
+//   0  input, no pull
+//   1  output, push-pull
+//   2  input with pull-up
+//   3  input with pull-down
+pub trait GpioOut
+    fn mode(self, pin: Int, dir: Int) [hw]
+    fn set(self, pin: Int, val: Int) [hw]
+    fn get(self, pin: Int) -> Int [hw]
+    // Reads the pin and writes the other level.  A chip with a toggle
+    // register, or whose input buffer is disconnected on an output pin,
+    // overrides this.
+    fn toggle(self, pin: Int) [hw]
+        self.set(pin, 1 - self.get(pin))
+
+// Waiting for a pin to change.  `wait_for_edge` parks the task until
+// the edge is seen on the pin and returns the level captured at the
+// transition.  `edge` selects:
+//   0  rising
+//   1  falling
+//   2  either
+pub trait GpioInAsync
+    async fn wait_for_edge(self, pin: Int, edge: Int) -> Int [hw]
+
+// ── UART ─────────────────────────────────────────────────────────────
+
+// The transmit half of a serial port.  Transmit and receive are
+// separate traits, so a port that can only write (a debug console) or
+// only read implements the half it has.  A `[u8]` argument is named
+// `data` throughout this file.
+pub trait UartTx
+    fn init(self, baud: Int) [hw]
+    fn write_byte(self, b: Int) [hw]
+    // Writes each byte in turn.  A DMA-backed implementation overrides
+    // this with one buffered transfer.
+    fn write_bytes(self, data: [u8]) [hw]
+        for b in data
+            self.write_byte(b as Int)
+
+// A DMA-backed implementation writes the whole buffer in one transfer
+// and resumes the caller when the transfer-complete interrupt fires.
+pub trait UartTxAsync
+    async fn write_byte(self, b: Int) [hw]
+    async fn write_bytes(self, data: [u8]) [hw]
+
+// `read_byte` waits until a byte arrives.  `try_read_byte` returns
+// `None` at once when no byte is waiting.
+pub trait UartRx
+    fn read_byte(self) -> Int [hw]
+    fn try_read_byte(self) -> ?Int [hw]
+
+// `read_bytes` reads exactly `n` bytes.
+pub trait UartRxAsync
+    async fn read_byte(self) -> Int [hw]
+    async fn read_bytes(self, n: Int) -> [u8] [hw]
+
+// ── Timer ────────────────────────────────────────────────────────────
+
+// A timer that waits by spinning the core, which suits start-up code
+// that runs before the scheduler, and counts the time since start.  The
+// names differ from `TimerAsync`'s `sleep_*` so the two costs are not
+// confused.
+pub trait Timer
+    fn delay_ms(self, ms: Int) [hw]
+    fn delay_us(self, us: Int) [hw]
+    fn ticks_ms(self) -> Int [hw]
+    fn ticks_us(self) -> Int [hw]
+
+// A timer that parks the calling task until the deadline and lets the
+// scheduler run others.
+pub trait TimerAsync
+    async fn sleep_ms(self, ms: Int) [hw]
+    async fn sleep_us(self, us: Int) [hw]
+
+// ── SPI ──────────────────────────────────────────────────────────────
+
+// An SPI bus.  SPI is full-duplex: each clock cycle exchanges one byte
+// each way.  `transfer` is that exchange; `write` and `read` send only
+// or receive only.  Chip select is a GPIO pin the caller drives around
+// a transfer, so one bus can serve several devices without the trait
+// knowing which.
+pub trait SpiBus
+    fn init(self, freq: Int, mode: Int) [hw]
+    fn transfer(self, b: Int) -> Int [hw]
+    fn write(self, data: [u8]) [hw]
+    fn read(self, n: Int) -> [u8] [hw]
+
+// `transfer_buf` sends `tx` and returns the bytes received while it
+// was sent, one for each.
+pub trait SpiBusAsync
+    async fn transfer(self, b: Int) -> Int [hw]
+    async fn transfer_buf(self, tx: [u8]) -> [u8] [hw]
+    async fn write(self, data: [u8]) [hw]
+    async fn read(self, n: Int) -> [u8] [hw]
+
+// ── I2C ──────────────────────────────────────────────────────────────
+
+// An I2C bus, half-duplex, with this side as the controller.
+// `write_read` sends a register address and reads bytes back in one
+// transaction with a repeated start, which is how most sensors are
+// read.
+//
+// `write` answers `true` when the device acknowledged.  `read` and
+// `write_read` answer `None` when the device did not acknowledge, which
+// is never the same thing as a present device returning no bytes.
+pub trait I2cBus
+    fn init(self, freq: Int) [hw]
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+    // Writes one register: the register's address, then its value.
+    fn write_reg(self, addr: Int, reg: Int, val: Int) -> Bool [hw]
+        self.write(addr, [reg as u8, val as u8])
+
+    // Reads one register in a single `write_read` transaction.
+    fn read_reg(self, addr: Int, reg: Int) -> ?Int [hw]
+        match self.write_read(addr, [reg as u8], 1)
+            Some(buf) => Some(buf[0] as Int)
+            None      => None
+
+// The I2C bus's transactions, each parking the task until the bus
+// completes it.
+pub trait I2cBusAsync
+    async fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+    async fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+    async fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+
+// ── ADC ──────────────────────────────────────────────────────────────
+
+// An analogue-to-digital converter.  `read_raw` returns the converter's
+// count, whose range is set by its resolution: 0 to 4095 at 12 bits, 0
+// to 1023 at 10.  `read_mv` converts the count to millivolts.
+pub trait Adc
+    fn read_raw(self, channel: Int) -> Int [hw]
+    // Converts for a 3.3 V reference and a 12-bit count.  A board with
+    // a calibrated reference or another resolution overrides it.
+    fn read_mv(self, channel: Int) -> Int [hw]
+        let raw = self.read_raw(channel)
+        raw * 3300 / 4096
+
+// A conversion that parks the task until the converter's
+// conversion-complete interrupt.
+pub trait AdcAsync
+    async fn read_raw(self, channel: Int) -> Int [hw]
+    async fn read_mv(self, channel: Int) -> Int [hw]
+
+// ── PWM ──────────────────────────────────────────────────────────────
+
+// A pulse-width modulation channel.  A register write sets the duty
+// cycle and the peripheral runs until it is disabled.  There is no
+// completion to wait for, so PWM has no async trait.  The duty cycle is
+// in parts per thousand, 0 to 1000.
+pub trait Pwm
+    fn init(self, channel: Int, freq: Int) [hw]
+    fn set_duty(self, channel: Int, duty: Int) [hw]
+    fn enable(self, channel: Int) [hw]
+    fn disable(self, channel: Int) [hw]
+
+// ── Block storage ────────────────────────────────────────────────────
+
+// A block device, which presents flash, an SD card or a RAM disk as an
+// array of fixed-size blocks for a filesystem to sit on.  The size and
+// the count are constants of the device, so they are sync only.  Reads
+// and writes move whole blocks.  Flash cannot be overwritten without an
+// erase, so `erase_block` is part of the trait; an SD card or a RAM
+// disk implements it as a no-op.
+pub trait BlockDevice
+    fn block_size(self) -> Int [hw]
+    fn block_count(self) -> Int [hw]
+    fn read_block(self, block: Int) -> ?[u8] [hw]
+    fn write_block(self, block: Int, data: [u8]) -> Bool [hw]
+    fn erase_block(self, block: Int) -> Bool [hw]
+
+// The host-scheduler form.  At `@tier(embedded)` use `AsyncBlock`,
+// below, which is the same contract in the form the tier admits.
+pub trait BlockDeviceAsync
+    async fn read_block(self, block: Int) -> ?[u8] [hw]
+    async fn write_block(self, block: Int, data: [u8]) -> Bool [hw]
+    async fn erase_block(self, block: Int) -> Bool [hw]
+
+// ── Awaitable peripherals ────────────────────────────────────────────
+//
+// The traits a device program awaits.  Each `*_arm` method starts the
+// operation on the hardware and returns the Future the peripheral's
+// interrupt resolves; the caller awaits it with
+// `core.rt.future_await`, in a function that declares `[async]`:
+//
+//     @tier(embedded)
+//     fn read_one(src: AsyncRead) -> Int [hw, async]
+//         let f = src.read_arm()
+//         return core.rt.future_await(f)
+//
+// An arm method is `[e]` and not `[e, async]`, because starting a
+// peripheral suspends nothing; the suspension is in the caller's await.
+//
+// A method here does not allocate.  The Future is the caller's to
+// create and release, one per event.
+//
+// A source holds one outstanding operation, because the hardware has
+// one: a UART has one receive register, so a second armed read has
+// nothing to complete it.  A second arm is refused through the Future
+// (a negative value) rather than queued.
+//
+// Every arm has an inverse, `*_disarm`, which answers whether the
+// operation was still armed:
+//
+//   true   the source has let go and will not resolve the Future; the
+//          caller may release it
+//   false  nothing was armed, or the interrupt already resolved the
+//          Future, which the caller should read rather than drop
+//
+// `core.rt.future_cancel` resolves the Future and tells the peripheral
+// nothing, so a cancel without a disarm leaves the peripheral holding a
+// handle the caller is about to release.  An implementation makes the
+// disarm atomic against its own interrupt, so that an event arriving
+// during the disarm is either delivered or refused, never both.
+//
+// Each source also counts how often its interrupt fired (`*_irqs`).
+// An implementation that completes the operation before the arm
+// returns reports 0; the count is the evidence that a wake came from
+// an interrupt and not from polling.
+//
+// A call through a trait-typed parameter, such as `src: AsyncRead`
+// above, is charged the effects of every implementation in the
+// program, because effects are inferred before specialisation.  A call
+// on a statically named receiver is charged its own implementation's.
+
+// A byte source.  The Future resolves with the byte, 0 to 255, or with
+// a negative value when a read was already outstanding.
+pub trait AsyncRead[e]
+    fn read_arm(self) -> Future [e]
+    fn read_disarm(self) -> Bool [e]
+    fn read_irqs(self) -> Int [e]
+
+// A deadline.  Unlike `Timer.delay_us`, which spins the core for the
+// interval, `after_us_arm` programs the timer and returns, so the core
+// can sleep.  The Future resolves with 0 on expiry, or with a negative
+// value when the deadline could not be armed.
+pub trait AsyncDeadline[e]
+    fn after_us_arm(self, us: Int) -> Future [e]
+    fn deadline_disarm(self) -> Bool [e]
+    fn deadline_irqs(self) -> Int [e]
+
+// A pin edge.  `edge` is 0 for rising, 1 for falling and 2 for either;
+// the Future resolves with the level captured at the transition.
+pub trait AsyncEdge[e]
+    fn edge_arm(self, pin: Int, edge: Int) -> Future [e]
+    fn edge_disarm(self, pin: Int) -> Bool [e]
+    fn edge_irqs(self) -> Int [e]
+
+// Block storage that completes a read, a write or an erase from its
+// interrupt.  Data moves through the device's own staging buffer
+// (`hal.block.buf_get` and `buf_set`), which is the shape of
+// DMA-capable storage and keeps the trait free of allocation.  The
+// geometry is not here: it is constant, so it never waits, and it is
+// read from `hal.block.size()` and `hal.block.count()`.
+//
+// The Future resolves with 0 on success and a negative value on
+// failure, including on a target with no storage, which answers
+// `hal.block.count() == 0`.  The three cases a caller can tell apart:
+//
+//   count 0                  no storage on this target
+//   count > 0, irqs 0        storage that completes before the arm
+//                            returns
+//   count > 0, irqs > 0      storage that completes on an interrupt
+//
+// The device has one operation in flight, not one per verb, so one
+// `block_disarm` takes back whichever is outstanding.
+pub trait AsyncBlock[e]
+    fn read_arm(self, block: Int) -> Future [e]
+    fn write_arm(self, block: Int) -> Future [e]
+    fn erase_arm(self, block: Int) -> Future [e]
+    fn block_disarm(self) -> Bool [e]
+    fn block_irqs(self) -> Int [e]
