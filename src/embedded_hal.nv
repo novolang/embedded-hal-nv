@@ -1,14 +1,24 @@
 // embedded_hal — the peripheral traits a device program is written
-// against, and the handles a board implements them for.
+// against, the handles that name a board's peripherals, and the
+// implementation of the traits for those handles.
 //
 // A program that writes `use embedded_hal` names a peripheral by its
 // handle (`BoardGpio`, `BoardUart`, `BoardTimer`) and calls it through
-// the traits below.  The board the program is built for supplies the
-// implementations: the board's package holds an `impl` of each trait
-// it can satisfy for each handle, beside its `bsp` declaration, and the
-// build adds that package when the program uses this module.  The same
-// source therefore builds for every board that implements the traits
-// it calls, and the image carries only the methods it calls.
+// the traits below.  A method a trait gives a body to forwards to the
+// standard library's `hal.*` hook of the same operation (`GpioOut.set`
+// calls `hal.gpio.set`), and the hook is the board's: the build links
+// the hooks of the board it is for, from the board's own package or,
+// where the board writes none, the runtime's default for its chip.  So
+// the implementations for the handles, at the end of this file, take
+// every method from the traits, and a board never writes one: what a
+// board's silicon does better it writes as a hook.  The same source
+// builds for every board, and the image carries only the methods it
+// calls.
+//
+// A type of a program's own, such as a test double or a driver for a
+// device on a bus, implements a trait by writing every method the
+// operation means for it.  A method it leaves out takes the trait's
+// body, which drives the board's peripheral, not the type's.
 //
 // Most peripheral kinds have two traits, a sync one and an async one.
 // A bit-banged software UART can only offer the sync trait; a
@@ -21,8 +31,8 @@
 // refused at `@tier(embedded)` (E4002): spawned, an `async fn`
 // allocates a state struct per spawn, and called directly it has its
 // awaits erased and suspends nowhere.  For a device, the awaitable
-// traits at the end of this file return the Future a peripheral's
-// interrupt resolves, and the caller awaits that handle.
+// traits at the end of this file start an operation that resolves a
+// Future the caller owns, and the caller awaits it.
 //
 // Every sync method and every `async fn` declares `[hw]`.  The
 // awaitable traits take an effect parameter instead (SPEC § 5.6), so a
@@ -68,8 +78,14 @@ struct BoardTimer
 //   3  input with pull-down
 pub trait GpioOut
     fn mode(self, pin: Int, dir: Int) [hw]
+        hal.gpio.mode(pin, dir)
+
     fn set(self, pin: Int, val: Int) [hw]
+        hal.gpio.set(pin, val)
+
     fn get(self, pin: Int) -> Int [hw]
+        hal.gpio.get(pin)
+
     // Reads the pin and writes the other level.  A chip with a toggle
     // register, or whose input buffer is disconnected on an output pin,
     // overrides this.
@@ -93,7 +109,11 @@ pub trait GpioInAsync
 // `data` throughout this file.
 pub trait UartTx
     fn init(self, baud: Int) [hw]
+        hal.uart.init(baud)
+
     fn write_byte(self, b: Int) [hw]
+        hal.uart.write_byte(b)
+
     // Writes each byte in turn.  A DMA-backed implementation overrides
     // this with one buffered transfer.
     fn write_bytes(self, data: [u8]) [hw]
@@ -107,10 +127,21 @@ pub trait UartTxAsync
     async fn write_bytes(self, data: [u8]) [hw]
 
 // `read_byte` waits until a byte arrives.  `try_read_byte` returns
-// `None` at once when no byte is waiting.
+// `None` at once when no byte is waiting.  The bodies read the board's
+// console input, the transport its log uses.
 pub trait UartRx
+    // Waits, polling, until a byte arrives.
     fn read_byte(self) -> Int [hw]
+        while true
+            let b = hal.uart.try_read_byte()
+            if b >= 0
+                return b
+
     fn try_read_byte(self) -> ?Int [hw]
+        let b = hal.uart.try_read_byte()
+        if b < 0
+            return None
+        return Some(b)
 
 // `read_bytes` reads exactly `n` bytes.
 pub trait UartRxAsync
@@ -125,9 +156,16 @@ pub trait UartRxAsync
 // confused.
 pub trait Timer
     fn delay_ms(self, ms: Int) [hw]
+        hal.timer.delay_ms(ms)
+
     fn delay_us(self, us: Int) [hw]
+        hal.timer.delay_us(us)
+
     fn ticks_ms(self) -> Int [hw]
+        hal.timer.ticks()
+
     fn ticks_us(self) -> Int [hw]
+        hal.timer.ticks_us()
 
 // A timer that parks the calling task until the deadline and lets the
 // scheduler run others.
@@ -227,11 +265,20 @@ pub trait Pwm
 // and writes move whole blocks.  Flash cannot be overwritten without an
 // erase, so `erase_block` is part of the trait; an SD card or a RAM
 // disk implements it as a no-op.
+//
+// A block's bytes move through a buffer the caller owns, a
+// `Vec[u8; 512]` passed by address, so neither side of the call
+// allocates: `read_block` replaces the buffer's contents with the
+// block's bytes, and `write_block` writes the bytes the buffer holds.
+// 512 is the largest block a device answers for; a device with smaller
+// blocks reads and writes `block_size()` bytes.  Each answers `false`
+// when the device refused the operation, and `read_block` then leaves
+// the buffer empty.
 pub trait BlockDevice
     fn block_size(self) -> Int [hw]
     fn block_count(self) -> Int [hw]
-    fn read_block(self, block: Int) -> ?[u8] [hw]
-    fn write_block(self, block: Int, data: [u8]) -> Bool [hw]
+    fn read_block(self, block: Int, var dst: Vec[u8; 512]) -> Bool [hw]
+    fn write_block(self, block: Int, var src: Vec[u8; 512]) -> Bool [hw]
     fn erase_block(self, block: Int) -> Bool [hw]
 
 // The host-scheduler form.  At `@tier(embedded)` use `AsyncBlock`,
@@ -244,31 +291,39 @@ pub trait BlockDeviceAsync
 // ── Awaitable peripherals ────────────────────────────────────────────
 //
 // The traits a device program awaits.  Each `*_arm` method starts the
-// operation on the hardware and returns the Future the peripheral's
-// interrupt resolves; the caller awaits it with
-// `core.rt.future_await`, in a function that declares `[async]`:
+// operation on the hardware and answers at once: 0 when the operation
+// is armed, and a negative value when it is refused.  The peripheral's
+// interrupt then resolves the Future the caller passed, which the
+// caller awaits with `core.rt.future_await`, in a function that
+// declares `[async]`:
 //
 //     @tier(embedded)
-//     fn read_one(src: AsyncRead) -> Int [hw, async]
-//         let f = src.read_arm()
+//     fn read_one(src: AsyncRead, f: Future) -> Int [hw, async]
+//         core.rt.future_reset(f)
+//         if src.read_arm(f) < 0
+//             return -1
 //         return core.rt.future_await(f)
 //
 // An arm method is `[e]` and not `[e, async]`, because starting a
 // peripheral suspends nothing; the suspension is in the caller's await.
 //
-// A method here does not allocate.  The Future is the caller's to
-// create and release, one per event.
+// The Future is the caller's.  A caller makes its Futures with
+// `core.rt.future_new()` before the work starts, during initialisation
+// or from a pool, and passes one to every arm; `core.rt.future_reset`
+// sets a resolved Future back to pending for the next.  An arm
+// allocates nothing, so a `@no_alloc` task arms through a trait.  An
+// arm that is refused may resolve the Future with the same negative
+// value, or leave it pending; the answer is what the caller reads.
 //
 // A source holds one outstanding operation, because the hardware has
 // one: a UART has one receive register, so a second armed read has
-// nothing to complete it.  A second arm is refused through the Future
-// (a negative value) rather than queued.
+// nothing to complete it.  A second arm is refused rather than queued.
 //
 // Every arm has an inverse, `*_disarm`, which answers whether the
 // operation was still armed:
 //
 //   true   the source has let go and will not resolve the Future; the
-//          caller may release it
+//          caller may reset it or release it
 //   false  nothing was armed, or the interrupt already resolved the
 //          Future, which the caller should read rather than drop
 //
@@ -288,26 +343,36 @@ pub trait BlockDeviceAsync
 // program, because effects are inferred before specialisation.  A call
 // on a statically named receiver is charged its own implementation's.
 
-// A byte source.  The Future resolves with the byte, 0 to 255, or with
-// a negative value when a read was already outstanding.
+// A byte source.  The Future resolves with the byte, 0 to 255.  The
+// bodies are the board's console input.
 pub trait AsyncRead[e]
-    fn read_arm(self) -> Future [e]
+    fn read_arm(self, f: Future) -> Int [e]
+        hal.uart.rx_arm(f)
+
     fn read_disarm(self) -> Bool [e]
+        hal.uart.rx_disarm()
+
     fn read_irqs(self) -> Int [e]
+        hal.uart.rx_irq_count()
 
 // A deadline.  Unlike `Timer.delay_us`, which spins the core for the
 // interval, `after_us_arm` programs the timer and returns, so the core
-// can sleep.  The Future resolves with 0 on expiry, or with a negative
-// value when the deadline could not be armed.
+// can sleep.  The Future resolves with 0 on expiry.  The bodies are the
+// board's deadline timer.
 pub trait AsyncDeadline[e]
-    fn after_us_arm(self, us: Int) -> Future [e]
+    fn after_us_arm(self, us: Int, f: Future) -> Int [e]
+        hal.timer.deadline_arm(us, f)
+
     fn deadline_disarm(self) -> Bool [e]
+        hal.timer.deadline_disarm()
+
     fn deadline_irqs(self) -> Int [e]
+        hal.timer.deadline_irq_count()
 
 // A pin edge.  `edge` is 0 for rising, 1 for falling and 2 for either;
 // the Future resolves with the level captured at the transition.
 pub trait AsyncEdge[e]
-    fn edge_arm(self, pin: Int, edge: Int) -> Future [e]
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int [e]
     fn edge_disarm(self, pin: Int) -> Bool [e]
     fn edge_irqs(self) -> Int [e]
 
@@ -330,8 +395,32 @@ pub trait AsyncEdge[e]
 // The device has one operation in flight, not one per verb, so one
 // `block_disarm` takes back whichever is outstanding.
 pub trait AsyncBlock[e]
-    fn read_arm(self, block: Int) -> Future [e]
-    fn write_arm(self, block: Int) -> Future [e]
-    fn erase_arm(self, block: Int) -> Future [e]
+    fn read_arm(self, block: Int, f: Future) -> Int [e]
+    fn write_arm(self, block: Int, f: Future) -> Int [e]
+    fn erase_arm(self, block: Int, f: Future) -> Int [e]
     fn block_disarm(self) -> Bool [e]
     fn block_irqs(self) -> Int [e]
+
+// ── The board's implementation ───────────────────────────────────────
+//
+// The handles take every method from the traits above, so each call
+// reaches the hook of the board the program is built for.  The one
+// method written here is GPIO's toggle: the hook toggles from the
+// output register, where the trait's read-then-write reads the input,
+// and on a chip whose input buffer is off on an output pin (the nRF
+// family's) the input reads 0 and the read-then-write would drive the
+// pin high every time.
+
+impl GpioOut for BoardGpio
+    fn toggle(self, pin: Int) [hw]
+        hal.gpio.toggle(pin)
+
+impl UartTx for BoardUart
+
+impl UartRx for BoardUart
+
+impl AsyncRead[hw] for BoardUart
+
+impl Timer for BoardTimer
+
+impl AsyncDeadline[hw] for BoardTimer

@@ -1,7 +1,7 @@
 [package]
 name        = "embedded-hal-nv"
-version     = "0.1.0"
-description = "The peripheral traits a device program is written against: GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, each as a sync trait and an async one, plus the awaitable form a microcontroller awaits.  A board package implements them for its own peripherals, so one program builds for every board that does."
+version     = "0.2.0"
+description = "The peripheral traits a device program is written against: GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, each as a sync trait and an async one, plus the awaitable form a microcontroller awaits.  The traits forward to the board's hal hooks, and the package implements them for the board's handles, so one program builds for every board and no board writes an implementation."
 license     = "Apache-2.0"
 stability   = "experimental"
 category    = "embedded"
@@ -9,8 +9,10 @@ layer       = "host"
 tags        = ["embedded", "hal", "gpio", "uart", "spi", "i2c", "timer", "microcontroller", "traits"]
 repository  = "https://github.com/novolang/embedded-hal-nv"
 maintainers = ["novo-lang"]
-# 0.17.0 is the toolchain this release was built and tested with.
-novo        = ">= 0.17.0"
+# 0.18.0 is the first release that reads an impl written as its header
+# alone, which the board's implementation at the end of the module is,
+# and that has core.rt.future_reset.
+novo        = ">= 0.18.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

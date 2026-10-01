@@ -4,9 +4,11 @@ A **hardware abstraction layer (HAL)** is the set of operations a
 program uses to drive a microcontroller's peripherals, such as setting
 a pin, writing a byte to a serial port or waiting for a millisecond,
 written so that the program does not depend on which chip it runs on.
-This package is that set for novo-lang, as traits. A board's package
-implements the traits for its own peripherals, so a program written
-against them builds for every board that does. The design follows
+This package is that set for novo-lang, as traits, and their
+implementation for the board a program is built for: each method
+forwards to the standard library's `hal.*` hook of the same operation,
+which the board supplies. A program written against the traits builds
+for every board. The design follows
 Rust's [`embedded-hal`](https://docs.rs/embedded-hal) and
 [`embedded-hal-async`](https://docs.rs/embedded-hal-async).
 
@@ -38,8 +40,8 @@ The async traits come in two forms. The ones spelled `async fn`, such as
 `UartTxAsync`, run on a host's scheduler. On a microcontroller at
 `@tier(embedded)` an `async fn` is refused (error E4002), so the
 **awaitable** traits there take its place: each `*_arm` method starts
-the operation and returns a `Future`, which the peripheral's interrupt
-completes and the caller awaits.
+the operation on a `Future` the caller owns, which the peripheral's
+interrupt completes and the caller awaits.
 
 A **board** is a particular circuit around a chip, such as the
 nRF52840-DK. The package declares three **handles** that name a board's
@@ -47,8 +49,15 @@ peripherals without naming the board: `BoardGpio`, `BoardUart` and
 `BoardTimer`. A handle is a struct with one field, `id`, which selects
 the instance of the peripheral (0 for the first). It holds no other
 state, since the state is in the peripheral's registers, so building
-one allocates nothing. The board's package implements the traits for
-the handles.
+one allocates nothing.
+
+The package implements the traits for the handles. A trait method's
+body calls the `hal.*` hook of the same operation (`GpioOut.set` calls
+`hal.gpio.set`), and the build links the hooks of the board it is for:
+the board package's own, written in novo-lang over the chip's
+registers, or the runtime's default for its chip where the board writes
+none. A board never implements a trait; what its silicon does better it
+writes as a hook.
 
 ## Install
 
@@ -56,9 +65,9 @@ the handles.
 novo pkg add embedded-hal-nv
 ```
 
-A program built for a board whose package implements the traits needs
-no install: the board's package depends on this one, and the build adds
-it when the program writes `use embedded_hal`.
+A program built for a board needs no install: the board's package
+depends on this one, and the build adds it when the program writes
+`use embedded_hal`.
 
 ## Example
 
@@ -90,7 +99,7 @@ fn main() [hw]
 
 | Module | What is in it |
 | --- | --- |
-| `embedded_hal` | The three board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage; and the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`. |
+| `embedded_hal` | The three board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer` and `AsyncDeadline` for the handles. |
 
 | Peripheral | Sync trait | Async trait | Awaitable trait |
 | --- | --- | --- | --- |
@@ -109,8 +118,7 @@ is no completion to wait for.
 
 ## How to choose an entry point
 
-- A program for any board uses the handles and the sync traits, which
-  every board implements first.
+- A program for any board uses the handles and the sync traits.
 - A driver for a device on a bus, such as a sensor on I2C, takes the
   bus as a trait-typed parameter (`bus: I2cBus`), so it works on any
   board and with a test double.
@@ -128,9 +136,13 @@ is no completion to wait for.
    answers `None` at once when no byte is waiting.
 4. `I2cBus.read` and `write_read` answer `None` when the device did not
    acknowledge, which is not the same as a device that sent no bytes.
-5. An awaitable source holds one operation at a time, because the
-   hardware has one. A second `*_arm` is refused: the Future resolves
-   with a negative value.
+5. An awaitable arm takes the caller's Future and answers 0 when the
+   operation is armed and a negative value when it is refused. The
+   caller makes its Futures once, with `core.rt.future_new()`, and sets
+   one back to pending with `core.rt.future_reset(f)` before the next
+   arm, so the arm allocates nothing and a `@no_alloc` task can call it.
+   An awaitable source holds one operation at a time, because the
+   hardware has one, and refuses a second arm.
 6. Every `*_arm` has an inverse, `*_disarm`. It answers `true` when the
    operation was still armed and the source has let go of the Future,
    which the caller may then release. It answers `false` when nothing
@@ -140,12 +152,23 @@ is no completion to wait for.
 7. `*_irqs` counts the interrupts a source has taken. A board whose
    implementation completes the operation before the arm returns
    reports 0.
-8. Five methods have a default body, so an implementation provides only
-   the primitives: `UartTx.write_bytes` writes each byte with
-   `write_byte`, `GpioOut.toggle` writes the other level with `get` and
-   `set`, `Adc.read_mv` converts `read_raw` for a 3.3 V reference and a
-   12-bit count, and `I2cBus.write_reg` and `read_reg` are one `write`
-   and one `write_read`. An implementation may override any of them.
+8. Two kinds of method have a body. Those of `GpioOut`, `UartTx`,
+   `UartRx`, `Timer`, `AsyncRead` and `AsyncDeadline` that name one
+   operation forward to the board's `hal.*` hook, which is how the
+   handles are implemented. Five more are written over the trait's own
+   methods: `UartTx.write_bytes` writes each byte with `write_byte`,
+   `GpioOut.toggle` writes the other level with `get` and `set`,
+   `Adc.read_mv` converts `read_raw` for a 3.3 V reference and a 12-bit
+   count, and `I2cBus.write_reg` and `read_reg` are one `write` and one
+   `write_read`.
+9. A type of a program's own, such as a driver for a device on a bus or
+   a test double, writes every method of a trait it implements. A
+   method it leaves out takes the trait's body, which for the forwarding
+   methods drives the board's peripheral and not the type's.
+10. `BlockDevice.read_block` and `write_block` move a block through a
+   `Vec[u8; 512]` the caller owns and passes as a `var` argument:
+   `read_block` replaces its contents with the block's bytes. Neither
+   side allocates.
 
 ## Running on a microcontroller
 
@@ -155,13 +178,12 @@ A method that takes or returns a `[u8]`, such as `UartTx.write_bytes`,
 needs a list, which a program at `@tier(embedded)` builds only into
 storage it owns.
 
-Five boards implement `GpioOut`, `UartTx`, `UartRx` and `Timer` for the
-handles, and the awaitable `AsyncRead` for `BoardUart` and
-`AsyncDeadline` for `BoardTimer`:
+Every board in novo-lang's catalogue supplies the hooks the traits
+forward to. Five of them, as an example of what the hooks do:
 
 | Board | `--target=` | GPIO | UART | Timer | Awaitable |
 | --- | --- | --- | --- | --- | --- |
-| Nordic nRF52840-DK | `nrf52840-dk` | port 0's registers, pulls included | RTT, the debug probe's log channel, or UART0 with `--hci-uart=physical` | the core's cycle counter at 64 MHz; the tick count is the time the delays have spent | complete before the arm returns (`*_irqs` reads 0) |
+| Nordic nRF52840-DK | `nrf52840-dk` | port 0's registers, pulls included, through the nRF GPIO driver written in novo-lang | RTT, the debug probe's log channel, or UARTE0 with `--hci-uart=physical`, whose receive completes from its interrupt | the core's cycle counter at 64 MHz; the tick count is the time the delays have spent | the read from UARTE0's interrupt under `--hci-uart=physical`, else before the arm returns; the deadline before the arm returns |
 | ST STM32F3DISCOVERY | `stm32f3discovery` | the GPIO ports' registers, pulls included | RTT, or USART1 with `--hci-uart=physical` | a microsecond clock on TIM2 | complete before the arm returns |
 | Arm MPS2 AN386 under QEMU | `nrf52-qemu` | a pin state in memory, each write printed | writes through semihosting, reads from the machine's UART | the machine's 25 MHz counter | complete from the UART's receive interrupt and TIMER1's |
 | Arm MPS2 AN505 under QEMU | `nrf53-qemu` | as the AN386 | as the AN386 | the machine's 20 MHz counter | as the AN386 |
@@ -180,8 +202,8 @@ own beside the copies inlined at their calls.
 
 ## What is not included
 
-- An implementation for any board. Each board's package carries its
-  own, because the registers differ from chip to chip.
+- The hooks. Each board's package, or the runtime for its chip,
+  carries them, because the registers differ from chip to chip.
 - A trait for interrupts. An interrupt handler is a function marked
   `@isr(<line>)`, whose signature is fixed by the hardware.
 - A trait for DMA descriptors. An async implementation uses whatever
@@ -193,18 +215,22 @@ own beside the copies inlined at their calls.
 
 The standard library's `hal.*` functions (`hal.gpio.set`,
 `hal.uart.write`) drive the same peripherals of the board a program is
-built for, without traits. A board's implementation of these traits
-calls them.
+built for, without traits. The traits' forwarding bodies call them.
 
 ## Tests
 
-`tests/defaults_tests.nv` runs the five default methods against test
-doubles on a host: which primitive each one calls and with what value,
-and what `read_reg` and `read_mv` answer. Each board's implementation
-is tested in the board's package, by a program that calls every method
-through the traits: under QEMU for an emulated board, and on the board
-through its debug probe for the nRF52840-DK and the STM32F3DISCOVERY.
-Each measures the implementation's line coverage on the device.
+`tests/defaults_tests.nv` runs the five bodies written over a trait's
+own methods against test doubles on a host: which method each one
+calls and with what value, and what `read_reg` and `read_mv` answer.
+`tests/board_tests.nv` calls the handles on a host, whose hooks answer
+a pin as 0 and refuse an arm with -1, so the answers show each call
+reached the hook; arms one Future again and again with
+`core.rt.future_reset`; and reads blocks into a caller's buffer. Each
+board's hooks are tested in the board's package, by a program that
+calls every method through the traits: under QEMU for an emulated
+board, and on the board through its debug probe. Each measures the
+line coverage of this module's bodies and the board's hooks on the
+device.
 
 ```
 novo pkg build

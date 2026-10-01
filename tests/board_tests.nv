@@ -1,0 +1,152 @@
+// board_tests — 0.2.0's forwarding bodies, the caller's Future and the
+// caller's block buffer, run on the host.
+//
+// The board's implementation at the end of src/embedded_hal.nv takes
+// every method from the traits, and each method forwards to the
+// standard library's `hal.*` hook.  On a host the hooks are the
+// runtime's stand-ins: a pin reads 0, and an arm is refused with -1 and
+// resolves the caller's Future with -1, because a host has no
+// peripheral to arm.  The tests read those answers back through the
+// handles, which is what shows the call reached the hook.
+//
+// A source of a program's own writes every method of an awaitable
+// trait and supplies the trait's effect parameter with nothing, so a
+// caller that reads through it declares no `[hw]`; one Future serves
+// every arm, set back to pending with `core.rt.future_reset`.  A block
+// device of a program's own fills the caller's buffer, so a read takes
+// no list.
+
+use std.test
+use core.rt
+use embedded_hal
+
+// ── The handles reach the board's hooks ──────────────────────────────
+
+@test
+fn test_board_gpio_reads_through_the_hook() [io, hw]
+    // The host's hal.gpio.get answers 0 for every pin.
+    test.assert(BoardGpio { id: 0 }.get(13) == 0)
+
+@test
+fn test_board_timer_arms_through_the_hook_with_the_caller_s_future() [io, hw, async]
+    let f = core.rt.future_new()
+    let t = BoardTimer { id: 0 }
+    // A host has no timer to arm: the hook refuses with -1 and resolves
+    // the Future the caller passed with the same value.
+    test.assert(t.after_us_arm(10, f) == -1)
+    test.assert(core.rt.future_await(f) == -1)
+    test.assert(not t.deadline_disarm())
+    test.assert(t.deadline_irqs() == 0)
+    core.rt.future_drop(f)
+
+@test
+fn test_board_uart_arms_through_the_hook_with_the_caller_s_future() [io, hw, async]
+    let f = core.rt.future_new()
+    let u = BoardUart { id: 0 }
+    test.assert(u.read_arm(f) == -1)
+    test.assert(core.rt.future_await(f) == -1)
+    test.assert(not u.read_disarm())
+    test.assert(u.read_irqs() == 0)
+    core.rt.future_drop(f)
+
+// ── A source of a program's own ──────────────────────────────────────
+
+// A byte source over a fixed number: each arm resolves the caller's
+// Future with the next byte at once.  It writes every method, and
+// supplies the effect parameter with nothing.
+@value
+struct Counter
+    first: Int
+
+impl AsyncRead[] for Counter
+    fn read_arm(self, f: Future) -> Int
+        if core.rt.future_is_ready(f)
+            // The Future still holds the last byte: a second arm.
+            return -2
+        core.rt.future_set(f, self.first)
+        0
+
+    fn read_disarm(self) -> Bool
+        false
+
+    fn read_irqs(self) -> Int
+        0
+
+// Reads one byte through the trait into the caller's Future, which it
+// sets back to pending first.  No `[hw]`: the source charges nothing.
+fn read_one<S: AsyncRead[e]>(src: S, f: Future) -> Int [e, async]
+    core.rt.future_reset(f)
+    if src.read_arm(f) < 0
+        return -1
+    core.rt.future_await(f)
+
+@test
+fn test_one_future_serves_every_arm_after_a_reset() [io, async]
+    let f = core.rt.future_new()
+    let c = Counter { first: 65 }
+    test.assert(read_one(c, f) == 65)
+    test.assert(read_one(c, f) == 65)
+    // Without the reset the Future is still resolved, and the source
+    // refuses the arm.
+    test.assert(c.read_arm(f) == -2)
+    core.rt.future_drop(f)
+
+// ── A block device of a program's own ────────────────────────────────
+
+// Four 4-byte blocks, block b holding b * 16 + i at byte i.  A write
+// is accepted for a block in range and changes nothing, so the reads
+// stay predictable.
+@value
+struct PatternDisk
+    blocks: Int
+
+impl BlockDevice for PatternDisk
+    fn block_size(self) -> Int [hw]
+        4
+
+    fn block_count(self) -> Int [hw]
+        self.blocks
+
+    fn read_block(self, block: Int, var dst: Vec[u8; 512]) -> Bool [hw]
+        dst.clear()
+        if block < 0 or block >= self.blocks
+            return false
+        for i in 0..4
+            let _ = dst.push((block * 16 + i) as u8)
+        true
+
+    fn write_block(self, block: Int, var src: Vec[u8; 512]) -> Bool [hw]
+        block >= 0 and block < self.blocks and src.len() == 4
+
+    fn erase_block(self, block: Int) -> Bool [hw]
+        block >= 0 and block < self.blocks
+
+@test
+fn test_read_block_fills_the_caller_s_buffer() [io, hw]
+    let disk = PatternDisk { blocks: 4 }
+    var buf: Vec[u8; 512] = Vec.new()
+    test.assert(disk.read_block(2, buf))
+    test.assert(buf.len() == 4)
+    test.assert((buf[0] as Int) == 32)
+    test.assert((buf[3] as Int) == 35)
+    // The same buffer again: replaced, not appended to.
+    test.assert(disk.read_block(1, buf))
+    test.assert(buf.len() == 4)
+    test.assert((buf[0] as Int) == 16)
+
+@test
+fn test_a_refused_read_leaves_the_buffer_empty() [io, hw]
+    let disk = PatternDisk { blocks: 4 }
+    var buf: Vec[u8; 512] = Vec.new()
+    test.assert(disk.read_block(0, buf))
+    test.assert(not disk.read_block(9, buf))
+    test.assert(buf.len() == 0)
+
+@test
+fn test_write_block_takes_the_caller_s_buffer() [io, hw]
+    let disk = PatternDisk { blocks: 4 }
+    var buf: Vec[u8; 512] = Vec.new()
+    test.assert(disk.read_block(3, buf))
+    test.assert(disk.write_block(3, buf))
+    test.assert(not disk.write_block(4, buf))
+    test.assert(disk.erase_block(0))

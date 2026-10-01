@@ -1,11 +1,11 @@
 // defaults_tests — the default methods the traits carry, run against
 // test doubles on the host.
 //
-// Five methods have a default body: `GpioOut.toggle`,
-// `UartTx.write_bytes`, `I2cBus.write_reg`, `I2cBus.read_reg` and
-// `Adc.read_mv`.  Each double implements only the methods its trait
-// requires.  The rest of the package is declarations, which have no
-// lines to run.
+// Five methods have a default body written over the trait's own
+// methods: `GpioOut.toggle`, `UartTx.write_bytes`, `I2cBus.write_reg`,
+// `I2cBus.read_reg` and `Adc.read_mv`.  Each double writes the methods
+// those call.  The bodies that forward to the board's `hal.*` hooks are
+// run in board_tests.nv.
 //
 // A trait method's receiver is a plain `self`, so a double cannot
 // record its calls in a list of its own.  The GPIO and UART doubles
