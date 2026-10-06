@@ -1,4 +1,4 @@
-// board_tests — 0.2.0's forwarding bodies, the caller's Future and the
+// board_tests — the forwarding bodies, the caller's Future and the
 // caller's block buffer, run on the host.
 //
 // The board's implementation at the end of src/embedded_hal.nv takes
@@ -48,6 +48,29 @@ fn test_board_uart_arms_through_the_hook_with_the_caller_s_future() [io, hw, asy
     test.assert(not u.read_disarm())
     test.assert(u.read_irqs() == 0)
     core.rt.future_drop(f)
+
+// The host has no I2C bus: no device acknowledges, so a write answers
+// false and a read None, and `read_reg`, the trait's body over
+// `write_read`, answers None too.
+@test
+fn test_board_i2c_reaches_the_hook() [io, hw]
+    let bus = BoardI2c { id: 0 }
+    bus.init(100000)
+    test.assert(not bus.write(0x48, [1 as u8, 0 as u8]))
+    test.assert(bus.read(0x48, 2) == None)
+    test.assert(bus.write_read(0x48, [0 as u8], 2) == None)
+    test.assert(not bus.write_reg(0x48, 1, 0))
+    test.assert(bus.read_reg(0x48, 0) == None)
+
+// The host has no SPI bus: a transfer reads 0 and a read answers no
+// bytes.
+@test
+fn test_board_spi_reaches_the_hook() [io, hw]
+    let bus = BoardSpi { id: 0 }
+    bus.init(1000000, 0)
+    test.assert(bus.transfer(0xA5) == 0)
+    bus.write([1 as u8, 2 as u8])
+    test.assert(list.len(bus.read(3)) == 0)
 
 // ── A source of a program's own ──────────────────────────────────────
 

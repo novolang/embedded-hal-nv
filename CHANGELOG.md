@@ -5,6 +5,30 @@ All notable changes to embedded-hal-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.2.1 — 2026-10-06
+
+A device driver has a concrete board bus to hold.
+
+### Added
+
+- **`BoardI2c` and `BoardSpi`**, handles for the board's I2C and SPI
+  buses, `@value` structs with one field, `id`, like the other three.
+  The package implements `I2cBus` for `BoardI2c` and `SpiBus` for
+  `BoardSpi`.
+- **`I2cBus` and `SpiBus` forward to the board's buses**: `init`,
+  `write`, `read` and `write_read` call `hal.i2c`'s operation of the
+  same name, and `init`, `transfer`, `write` and `read` call `hal.spi`'s.
+  The build generates those operations over the driver the board names
+  with `@hal(i2c)` and `@hal(spi)`; on a board that names none, no I2C
+  device acknowledges and an SPI read answers no bytes.  A type of a
+  program's own that writes all four methods, as a test double does, is
+  unchanged.
+
+### Changed
+
+- The toolchain floor is 0.18.4, the first release with `hal.i2c` and
+  `hal.spi` as layers over the board's drivers.
+
 ## 0.2.0 — 2026-10-01
 
 A board no longer implements the traits; this package does.

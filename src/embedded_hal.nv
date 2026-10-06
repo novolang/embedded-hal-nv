@@ -3,7 +3,8 @@
 // implementation of the traits for those handles.
 //
 // A program that writes `use embedded_hal` names a peripheral by its
-// handle (`BoardGpio`, `BoardUart`, `BoardTimer`) and calls it through
+// handle (`BoardGpio`, `BoardUart`, `BoardTimer`, `BoardI2c`,
+// `BoardSpi`) and calls it through
 // the traits below.  A method a trait gives a body to forwards to the
 // standard library's `hal.*` hook of the same operation (`GpioOut.set`
 // calls `hal.gpio.set`), and the hook is the board's: the build links
@@ -65,6 +66,20 @@ struct BoardUart
 // board uses for its delays and its tick count.
 pub @value
 struct BoardTimer
+    id: Int
+
+// An I2C bus of the board, with the microcontroller as the controller.
+// `id` selects the bus; 0 is the one the board's documentation names
+// for `hal.i2c`.  A device driver holds one to reach a chip on the bus.
+pub @value
+struct BoardI2c
+    id: Int
+
+// An SPI bus of the board, with the microcontroller as the controller.
+// `id` selects the bus; 0 is the one the board's documentation names
+// for `hal.spi`.  The chip-select pins are the board's GPIO.
+pub @value
+struct BoardSpi
     id: Int
 
 // ── GPIO ─────────────────────────────────────────────────────────────
@@ -180,11 +195,23 @@ pub trait TimerAsync
 // or receive only.  Chip select is a GPIO pin the caller drives around
 // a transfer, so one bus can serve several devices without the trait
 // knowing which.
+//
+// `init`'s `freq` is the clock in hertz, which a controller rounds down
+// to the nearest rate its divider gives, and `mode` is the SPI mode, 0
+// to 3: bit 1 is the clock's idle level (CPOL) and bit 0 the edge data
+// is sampled on (CPHA).  `read` clocks out 0xFF for each byte it reads.
 pub trait SpiBus
     fn init(self, freq: Int, mode: Int) [hw]
+        hal.spi.init(freq, mode)
+
     fn transfer(self, b: Int) -> Int [hw]
+        hal.spi.transfer(b)
+
     fn write(self, data: [u8]) [hw]
+        hal.spi.write(data)
+
     fn read(self, n: Int) -> [u8] [hw]
+        hal.spi.read(n)
 
 // `transfer_buf` sends `tx` and returns the bytes received while it
 // was sent, one for each.
@@ -204,11 +231,22 @@ pub trait SpiBusAsync
 // `write` answers `true` when the device acknowledged.  `read` and
 // `write_read` answer `None` when the device did not acknowledge, which
 // is never the same thing as a present device returning no bytes.
+//
+// `init`'s `freq` is the clock in hertz: 100000 for standard mode,
+// 400000 for fast mode.  `addr` is the device's 7-bit address.
 pub trait I2cBus
     fn init(self, freq: Int) [hw]
+        hal.i2c.init(freq)
+
     fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        hal.i2c.write(addr, data)
+
     fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        hal.i2c.read(addr, n)
+
     fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        hal.i2c.write_read(addr, tx, n)
+
     // Writes one register: the register's address, then its value.
     fn write_reg(self, addr: Int, reg: Int, val: Int) -> Bool [hw]
         self.write(addr, [reg as u8, val as u8])
@@ -216,6 +254,7 @@ pub trait I2cBus
     // Reads one register in a single `write_read` transaction.
     fn read_reg(self, addr: Int, reg: Int) -> ?Int [hw]
         match self.write_read(addr, [reg as u8], 1)
+            // cov: skip — runs only on a board whose I2C bus has a device that answers; the boards' suites measure this module on boards with and without one
             Some(buf) => Some(buf[0] as Int)
             None      => None
 
@@ -403,6 +442,12 @@ pub trait AsyncBlock[e]
 
 // ── The board's implementation ───────────────────────────────────────
 //
+// A handle implements no trait spelled with `async fn`: a handle is a
+// `@value` struct, and an `async fn` takes none (SPEC § 14.5), because
+// a suspended frame stores its slots as pointers.  On a device the
+// awaitable traits are the async form, as `AsyncRead` and
+// `AsyncDeadline` are for `BoardUart` and `BoardTimer`.
+//
 // The handles take every method from the traits above, so each call
 // reaches the hook of the board the program is built for.  The one
 // method written here is GPIO's toggle: the hook toggles from the
@@ -424,3 +469,7 @@ impl AsyncRead[hw] for BoardUart
 impl Timer for BoardTimer
 
 impl AsyncDeadline[hw] for BoardTimer
+
+impl I2cBus for BoardI2c
+
+impl SpiBus for BoardSpi

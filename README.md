@@ -44,9 +44,9 @@ the operation on a `Future` the caller owns, which the peripheral's
 interrupt completes and the caller awaits.
 
 A **board** is a particular circuit around a chip, such as the
-nRF52840-DK. The package declares three **handles** that name a board's
-peripherals without naming the board: `BoardGpio`, `BoardUart` and
-`BoardTimer`. A handle is a struct with one field, `id`, which selects
+nRF52840-DK. The package declares five **handles** that name a board's
+peripherals without naming the board: `BoardGpio`, `BoardUart`,
+`BoardTimer`, `BoardI2c` and `BoardSpi`. A handle is a struct with one field, `id`, which selects
 the instance of the peripheral (0 for the first). It holds no other
 state, since the state is in the peripheral's registers, so building
 one allocates nothing.
@@ -99,29 +99,34 @@ fn main() [hw]
 
 | Module | What is in it |
 | --- | --- |
-| `embedded_hal` | The three board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer` and `AsyncDeadline` for the handles. |
+| `embedded_hal` | The five board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus` and `SpiBus` for the handles. |
 
-| Peripheral | Sync trait | Async trait | Awaitable trait |
-| --- | --- | --- | --- |
-| GPIO | `GpioOut` | `GpioInAsync` | `AsyncEdge` |
-| UART transmit | `UartTx` | `UartTxAsync` | — |
-| UART receive | `UartRx` | `UartRxAsync` | `AsyncRead` |
-| Timer | `Timer` | `TimerAsync` | `AsyncDeadline` |
-| SPI | `SpiBus` | `SpiBusAsync` | — |
-| I2C | `I2cBus` | `I2cBusAsync` | — |
-| ADC | `Adc` | `AdcAsync` | — |
-| PWM | `Pwm` | — | — |
-| Block storage | `BlockDevice` | `BlockDeviceAsync` | `AsyncBlock` |
+| Peripheral | Handle | Sync trait | Async trait | Awaitable trait |
+| --- | --- | --- | --- | --- |
+| GPIO | `BoardGpio` | `GpioOut` | `GpioInAsync` | `AsyncEdge` |
+| UART transmit | `BoardUart` | `UartTx` | `UartTxAsync` | — |
+| UART receive | `BoardUart` | `UartRx` | `UartRxAsync` | `AsyncRead` |
+| Timer | `BoardTimer` | `Timer` | `TimerAsync` | `AsyncDeadline` |
+| SPI | `BoardSpi` | `SpiBus` | `SpiBusAsync` | — |
+| I2C | `BoardI2c` | `I2cBus` | `I2cBusAsync` | — |
+| ADC | — | `Adc` | `AdcAsync` | — |
+| PWM | — | `Pwm` | — | — |
+| Block storage | — | `BlockDevice` | `BlockDeviceAsync` | `AsyncBlock` |
 
-PWM has no async trait: a register write sets the duty cycle and there
-is no completion to wait for.
+A handle implements the sync trait and, where there is one, the
+awaitable trait of its row; the async traits are for types of a
+program's own on a host, since a handle is a `@value` struct and an
+`async fn` takes none. PWM has no async trait: a register write sets
+the duty cycle and there is no completion to wait for.
 
 ## How to choose an entry point
 
 - A program for any board uses the handles and the sync traits.
-- A driver for a device on a bus, such as a sensor on I2C, takes the
-  bus as a trait-typed parameter (`bus: I2cBus`), so it works on any
-  board and with a test double.
+- A driver for a device on a bus, such as a sensor on I2C, writes its
+  register reads and writes as functions generic over the bus
+  (`<B: I2cBus>`), so they work on any board and with a test double,
+  and holds the board's bus, a `BoardI2c` or a `BoardSpi`, in the type
+  a program uses.
 - A program that waits for a peripheral at `@tier(embedded)` uses the
   awaitable traits. The `async fn` traits are for a host's scheduler.
 
@@ -136,6 +141,9 @@ is no completion to wait for.
    answers `None` at once when no byte is waiting.
 4. `I2cBus.read` and `write_read` answer `None` when the device did not
    acknowledge, which is not the same as a device that sent no bytes.
+   An I2C `addr` is the device's 7-bit address. `SpiBus.init`'s `mode`
+   is the SPI mode, 0 to 3, and chip select is a GPIO pin the caller
+   drives around a transfer.
 5. An awaitable arm takes the caller's Future and answers 0 when the
    operation is armed and a negative value when it is refused. The
    caller makes its Futures once, with `core.rt.future_new()`, and sets
@@ -153,8 +161,8 @@ is no completion to wait for.
    implementation completes the operation before the arm returns
    reports 0.
 8. Two kinds of method have a body. Those of `GpioOut`, `UartTx`,
-   `UartRx`, `Timer`, `AsyncRead` and `AsyncDeadline` that name one
-   operation forward to the board's `hal.*` hook, which is how the
+   `UartRx`, `Timer`, `AsyncRead`, `AsyncDeadline`, `I2cBus` and
+   `SpiBus` that name one operation forward to the board's `hal.*` hook, which is how the
    handles are implemented. Five more are written over the trait's own
    methods: `UartTx.write_bytes` writes each byte with `write_byte`,
    `GpioOut.toggle` writes the other level with `get` and `set`,
@@ -181,13 +189,13 @@ storage it owns.
 Every board in novo-lang's catalogue supplies the hooks the traits
 forward to. Five of them, as an example of what the hooks do:
 
-| Board | `--target=` | GPIO | UART | Timer | Awaitable |
-| --- | --- | --- | --- | --- | --- |
-| Nordic nRF52840-DK | `nrf52840-dk` | port 0's registers, pulls included, through the nRF GPIO driver written in novo-lang | RTT, the debug probe's log channel, or UARTE0 with `--hci-uart=physical`, whose receive completes from its interrupt | the core's cycle counter at 64 MHz; the tick count is the time the delays have spent | the read from UARTE0's interrupt under `--hci-uart=physical`, else before the arm returns; the deadline before the arm returns |
-| ST STM32F3DISCOVERY | `stm32f3discovery` | the GPIO ports' registers, pulls included | RTT, or USART1 with `--hci-uart=physical` | a microsecond clock on TIM2 | complete before the arm returns |
-| Arm MPS2 AN386 under QEMU | `nrf52-qemu` | a pin state in memory, each write printed | writes through semihosting, reads from the machine's UART | the machine's 25 MHz counter | complete from the UART's receive interrupt and TIMER1's |
-| Arm MPS2 AN505 under QEMU | `nrf53-qemu` | as the AN386 | as the AN386 | the machine's 20 MHz counter | as the AN386 |
-| Netduino Plus 2 under QEMU | `stm32f3-qemu` | a pin state in memory, each write printed | writes through semihosting, reads from USART1 | a microsecond clock on TIM2 | the read from USART1's interrupt, the deadline before the arm returns |
+| Board | `--target=` | GPIO | UART | Timer | I2C and SPI | Awaitable |
+| --- | --- | --- | --- | --- | --- | --- |
+| Nordic nRF52840-DK | `nrf52840-dk` | port 0's registers, pulls included, through the nRF GPIO driver written in novo-lang | RTT, the debug probe's log channel, or UARTE0 with `--hci-uart=physical`, whose receive completes from its interrupt | the core's cycle counter at 64 MHz; the tick count is the time the delays have spent | no driver yet: no device acknowledges, and an SPI read answers no bytes | the read from UARTE0's interrupt under `--hci-uart=physical`, else before the arm returns; the deadline before the arm returns |
+| NXP FRDM-MCXN947 | `frdm-mcxn947` | the PORT and GPIO blocks' registers, pulls included | RTT, or LP_FLEXCOMM4's LPUART with `--hci-uart=physical` | a microsecond clock on CTIMER0 | I2C on LP_FLEXCOMM5's LPI2C, the bus of the board's P3T1755DP temperature sensor, at address 0x48; no SPI driver yet | the read from LP_FLEXCOMM4's interrupt under `--hci-uart=physical`, else before the arm returns; the deadline before the arm returns |
+| ST STM32F3DISCOVERY | `stm32f3discovery` | the GPIO ports' registers, pulls included | RTT, or USART1 with `--hci-uart=physical` | a microsecond clock on TIM2 | no driver yet | complete before the arm returns |
+| Arm MPS2 AN386 under QEMU | `nrf52-qemu` | a pin state in memory, each write printed | writes through semihosting, reads from the machine's UART | the machine's 25 MHz counter | SPI on the machine's first PL022 controller, in its loopback mode, so each byte sent is the byte read; no I2C driver | complete from the UART's receive interrupt and TIMER1's |
+| Arm MPS2 AN505 under QEMU | `nrf53-qemu` | as the AN386 | as the AN386 | the machine's 20 MHz counter | no driver yet | as the AN386 |
 
 `UartRx` reads the board's console: RTT's down channel on a board that
 logs over RTT, the UART under `--hci-uart=physical`, and the machine's
@@ -223,8 +231,8 @@ built for, without traits. The traits' forwarding bodies call them.
 own methods against test doubles on a host: which method each one
 calls and with what value, and what `read_reg` and `read_mv` answer.
 `tests/board_tests.nv` calls the handles on a host, whose hooks answer
-a pin as 0 and refuse an arm with -1, so the answers show each call
-reached the hook; arms one Future again and again with
+a pin as 0, refuse an arm with -1 and acknowledge no I2C write, so the
+answers show each call reached the hook; arms one Future again and again with
 `core.rt.future_reset`; and reads blocks into a caller's buffer. Each
 board's hooks are tested in the board's package, by a program that
 calls every method through the traits: under QEMU for an emulated
