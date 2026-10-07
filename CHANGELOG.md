@@ -5,6 +5,48 @@ All notable changes to embedded-hal-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.3.0 — 2026-10-08
+
+A CAN controller, classic frames only.
+
+### Added
+
+- **`CanBus`**, a trait for a CAN controller: `open(bitrate, mode)`
+  starts it at a bit rate in `CAN_MODE_NORMAL` or `CAN_MODE_LOOPBACK`,
+  where the controller receives its own frames and drives nothing onto
+  the bus; `send(frame)` hands it a frame; `receive()` answers the next
+  frame, or `None` when none waits; `tx_done()` answers whether no frame
+  still waits for the bus; `bitrate()` reads the rate back from the
+  controller; `errors()` reads the error counters and the fault
+  confinement state.  Every method forwards to the standard library's
+  `hal.can`, which the build generates over the controller a board
+  names with `@hal(can)`; on a board that names none an open is refused.
+- **`CanBusFrame`**, a `@value` frame: an 11-bit or 29-bit identifier,
+  the remote flag, a length of 0 to 8 and the data bytes in one `Int`,
+  byte 0 in bits 0 to 7.  `can_data`, `can_data_ext` and `can_remote`
+  build one; `can_byte`, `can_payload`, `can_frame_valid`, `can_flags`,
+  `can_header` and `can_frame_of` read and pack it.
+- **`CanBusErrors`**, the transmit and receive error counters and the
+  state, `CAN_ERROR_ACTIVE`, `CAN_ERROR_PASSIVE` or `CAN_BUS_OFF`, and
+  `can_errors_of`, which unpacks `hal.can.errors`' word.
+- **`BoardCan`**, the handle for a board's CAN controller, and the
+  implementation of `CanBus` for it.
+
+CAN FD is not here; its frames carry up to 64 bytes and would be a trait
+of its own.  No `async fn` form is declared: an `async fn` takes no
+`@value` struct, and a frame is one.
+
+### Changed
+
+- `tests/board_tests.nv` runs the GPIO, UART and timer handles'
+  forwarding bodies on the host, and `tests/coverage.sh` reports the
+  line coverage of `src/` merged across the suites; the lines only a
+  board runs carry a `cov: skip` marker with the reason.
+- The toolchain floor is 0.19.3, the first release with `hal.can`.  The
+  minor number moves because a toolchain older than the floor cannot
+  build the module at all, so a build that took this release under a
+  `^0.2` requirement would fail.  No signature of 0.2.1 changed.
+
 ## 0.2.1 — 2026-10-06
 
 A device driver has a concrete board bus to hold.

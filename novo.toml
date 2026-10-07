@@ -1,19 +1,18 @@
 [package]
 name        = "embedded-hal-nv"
-version     = "0.2.1"
-description = "The peripheral traits a device program is written against: GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, each as a sync trait and an async one, plus the awaitable form a microcontroller awaits.  The traits forward to the board's hal hooks, and the package implements them for the board's handles, so one program builds for every board and no board writes an implementation."
+version     = "0.3.0"
+description = "The peripheral traits a device program is written against: GPIO, UART, timers, SPI, I2C, CAN, ADC, PWM and block storage, each as a sync trait and an async one, plus the awaitable form a microcontroller awaits.  The traits forward to the board's hal hooks, and the package implements them for the board's handles, so one program builds for every board and no board writes an implementation."
 license     = "Apache-2.0"
 stability   = "experimental"
 category    = "embedded"
 layer       = "host"
-tags        = ["embedded", "hal", "gpio", "uart", "spi", "i2c", "timer", "microcontroller", "traits"]
+tags        = ["embedded", "hal", "gpio", "uart", "spi", "i2c", "can", "timer", "microcontroller", "traits"]
 repository  = "https://github.com/novolang/embedded-hal-nv"
 maintainers = ["novo-lang"]
-# 0.18.4 is the first release whose standard library has hal.i2c and
-# hal.spi as layers over the board's drivers, with
-# hal.i2c.write_read and hal.spi.read, which the bodies of I2cBus and
-# SpiBus call.
-novo        = ">= 0.18.4"
+# 0.19.3 is the first release whose standard library has hal.can, a
+# layer over the CAN controller a board names with @hal(can), which the
+# bodies of CanBus call.
+novo        = ">= 0.19.3"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

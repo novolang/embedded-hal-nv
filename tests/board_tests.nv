@@ -72,6 +72,26 @@ fn test_board_spi_reaches_the_hook() [io, hw]
     bus.write([1 as u8, 2 as u8])
     test.assert(list.len(bus.read(3)) == 0)
 
+// The host's GPIO, UART and timer stand-ins take every forwarding body:
+// a pin reads 0, a byte written goes to the test's output, and the
+// delays return.  The console's read is left to the boards: on a host it
+// would read the test's standard input.
+@test
+fn test_board_gpio_uart_and_timer_reach_their_hooks() [io, hw]
+    let gpio = BoardGpio { id: 0 }
+    gpio.mode(13, 1)
+    gpio.set(13, 1)
+    gpio.toggle(13)
+    test.assert(gpio.get(13) == 0)
+    let uart = BoardUart { id: 0 }
+    uart.init(115200)
+    uart.write_byte(10)
+    let t = BoardTimer { id: 0 }
+    t.delay_ms(1)
+    t.delay_us(1)
+    test.assert(t.ticks_ms() >= 0)
+    test.assert(t.ticks_us() >= 0)
+
 // ── A source of a program's own ──────────────────────────────────────
 
 // A byte source over a fixed number: each arm resolves the caller's

@@ -1,0 +1,154 @@
+// can_tests — the CAN frame, its words, and `CanBus`, run on the host.
+//
+// The frame helpers and the header word are arithmetic and are checked
+// against the bit positions `hal.can` uses.  The trait's bodies
+// forward to `hal.can`, which on a host answers as absent hardware: an
+// open and a send are refused, nothing is received, and the bit rate
+// and the counters read 0.  A bus of a program's own, a mailbox that
+// holds the last frame sent, writes every method, as a test double or a
+// driver for a controller on SPI does.
+
+use std.test
+use embedded_hal
+
+// ── The frame ────────────────────────────────────────────────────────
+
+@test
+fn test_a_data_frame_holds_its_bytes_low_byte_first() [io]
+    let f = embedded_hal.can_data(0x123, 3, 0x332211)
+    test.assert(f.id == 0x123)
+    test.assert(not f.extended)
+    test.assert(not f.remote)
+    test.assert(embedded_hal.can_byte(f, 0) == 0x11)
+    test.assert(embedded_hal.can_byte(f, 2) == 0x33)
+    // Past the length, and before the start, a byte reads 0.
+    test.assert(embedded_hal.can_byte(f, 3) == 0)
+    test.assert(embedded_hal.can_byte(f, -1) == 0)
+
+@test
+fn test_eight_bytes_fill_the_data_word() [io]
+    let f = embedded_hal.can_data_ext(0x1ABCDEF0, 8, 0x0807060504030201)
+    test.assert(f.extended)
+    test.assert(embedded_hal.can_byte(f, 7) == 8)
+    test.assert(embedded_hal.can_payload(f) == 0x0807060504030201)
+
+@test
+fn test_the_payload_keeps_the_first_len_bytes() [io]
+    test.assert(embedded_hal.can_payload(embedded_hal.can_data(1, 2, 0xAABBCC)) == 0xBBCC)
+    test.assert(embedded_hal.can_payload(embedded_hal.can_data(1, 0, 0xAABBCC)) == 0)
+
+@test
+fn test_a_remote_frame_carries_no_data() [io]
+    let f = embedded_hal.can_remote(0x7FF, false, 4)
+    test.assert(f.remote)
+    test.assert(f.len == 4)
+    test.assert(embedded_hal.can_payload(f) == 0)
+    test.assert(embedded_hal.can_byte(f, 0) == 0)
+    test.assert(embedded_hal.can_flags(f) == 2)
+    test.assert(embedded_hal.can_flags(embedded_hal.can_remote(5, true, 0)) == 3)
+
+@test
+fn test_validity_is_the_identifier_s_width_and_the_length() [io]
+    test.assert(embedded_hal.can_frame_valid(embedded_hal.can_data(0x7FF, 8, 0)))
+    test.assert(not embedded_hal.can_frame_valid(embedded_hal.can_data(0x800, 0, 0)))
+    test.assert(embedded_hal.can_frame_valid(embedded_hal.can_data_ext(0x1FFFFFFF, 0, 0)))
+    test.assert(not embedded_hal.can_frame_valid(embedded_hal.can_data_ext(0x20000000, 0, 0)))
+    test.assert(not embedded_hal.can_frame_valid(embedded_hal.can_data(1, 9, 0)))
+    test.assert(not embedded_hal.can_frame_valid(embedded_hal.can_data(-1, 0, 0)))
+
+// The header word and the frame read back from it are the same frame,
+// for both identifier widths and the remote flag.
+@test
+fn test_the_header_word_round_trips() [io]
+    let a = embedded_hal.can_data_ext(0x1F0F0F0F, 8, -1)
+    let h = embedded_hal.can_header(a)
+    test.assert((h & 0xF) == 8)
+    test.assert(((h >> 4) & 3) == 1)
+    let b = embedded_hal.can_frame_of(h, -1)
+    test.assert(b.id == 0x1F0F0F0F and b.extended and not b.remote and b.len == 8)
+    test.assert(b.data == -1)
+    let r = embedded_hal.can_frame_of(embedded_hal.can_header(embedded_hal.can_remote(0x42, false, 2)), 0x1234)
+    test.assert(r.remote and r.id == 0x42 and r.len == 2 and r.data == 0)
+    // A data word longer than the frame is cut to its length.
+    test.assert(embedded_hal.can_frame_of(embedded_hal.can_header(embedded_hal.can_data(1, 1, 0)), 0x1234).data == 0x34)
+
+@test
+fn test_the_error_word_unpacks() [io]
+    let e = embedded_hal.can_errors_of(0x10880)
+    test.assert(e.tx == 0x80 and e.rx == 0x08 and e.state == embedded_hal.CAN_ERROR_PASSIVE)
+    test.assert(embedded_hal.can_errors_of(0x20000).state == embedded_hal.CAN_BUS_OFF)
+    test.assert(embedded_hal.can_errors_of(0x30000).state == embedded_hal.CAN_BUS_OFF)
+    test.assert(embedded_hal.can_errors_of(0).state == embedded_hal.CAN_ERROR_ACTIVE)
+
+// ── The board's controller on a host ─────────────────────────────────
+
+// A host has no CAN controller: `hal.can` refuses the open and the
+// send, answers nothing received, and reads 0 for the rate and the
+// counters.  An invalid frame is refused before it reaches the hook.
+@test
+fn test_board_can_reaches_the_hook() [io, hw]
+    let can = BoardCan { id: 0 }
+    test.assert(not can.open(500000, embedded_hal.CAN_MODE_LOOPBACK))
+    test.assert(not can.send(embedded_hal.can_data(0x123, 1, 7)))
+    test.assert(not can.send(embedded_hal.can_data(0x800, 1, 7)))
+    test.assert(can.receive() == None)
+    test.assert(not can.tx_done())
+    test.assert(can.bitrate() == 0)
+    let e = can.errors()
+    test.assert(e.tx == 0 and e.rx == 0 and e.state == embedded_hal.CAN_ERROR_ACTIVE)
+
+// ── A bus of a program's own ─────────────────────────────────────────
+
+// A bus that always holds one frame, given as the header and data words
+// `hal.can` uses, or none when `header` is negative, and that runs at
+// the rate it was built with.  It writes every method, as a test double
+// or a driver for a controller on SPI does.
+@value
+struct Held
+    header: Int
+    data: Int
+    rate: Int
+
+impl CanBus for Held
+    fn open(self, bitrate: Int, mode: Int) -> Bool [hw]
+        bitrate == self.rate and mode == embedded_hal.CAN_MODE_LOOPBACK
+
+    fn send(self, f: CanBusFrame) -> Bool [hw]
+        embedded_hal.can_frame_valid(f)
+
+    fn receive(self) -> ?CanBusFrame [hw]
+        if self.header < 0
+            return None
+        Some(embedded_hal.can_frame_of(self.header, self.data))
+
+    fn tx_done(self) -> Bool [hw]
+        self.rate > 0
+
+    fn bitrate(self) -> Int [hw]
+        self.rate
+
+    fn errors(self) -> CanBusErrors [hw]
+        embedded_hal.can_errors_of(0x10880)
+
+// Sends through any `CanBus` and answers the frame it then receives.
+fn echo<B: CanBus>(bus: B, f: CanBusFrame) -> ?CanBusFrame [hw]
+    if not bus.send(f)
+        return None
+    bus.receive()
+
+@test
+fn test_a_bus_of_a_program_s_own_carries_a_frame() [io, hw]
+    let sent = embedded_hal.can_data_ext(0x1234567, 4, 0xDDCCBBAA)
+    let bus = Held { header: embedded_hal.can_header(sent), data: sent.data, rate: 125000 }
+    test.assert(bus.open(125000, embedded_hal.CAN_MODE_LOOPBACK))
+    test.assert(not bus.open(500000, embedded_hal.CAN_MODE_LOOPBACK))
+    test.assert(bus.bitrate() == 125000)
+    test.assert(bus.tx_done())
+    match echo(bus, sent)
+        Some(r) =>
+            test.assert(r.id == 0x1234567 and r.extended and r.len == 4)
+            test.assert(embedded_hal.can_byte(r, 3) == 0xDD)
+        None    => test.assert(false)
+    test.assert(echo(bus, embedded_hal.can_data(0x800, 0, 0)) == None)
+    test.assert(echo(Held { header: -1, data: 0, rate: 0 }, sent) == None)
+    test.assert(bus.errors().state == embedded_hal.CAN_ERROR_PASSIVE)

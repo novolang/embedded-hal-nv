@@ -4,7 +4,7 @@
 //
 // A program that writes `use embedded_hal` names a peripheral by its
 // handle (`BoardGpio`, `BoardUart`, `BoardTimer`, `BoardI2c`,
-// `BoardSpi`) and calls it through
+// `BoardSpi`, `BoardCan`) and calls it through
 // the traits below.  A method a trait gives a body to forwards to the
 // standard library's `hal.*` hook of the same operation (`GpioOut.set`
 // calls `hal.gpio.set`), and the hook is the board's: the build links
@@ -82,6 +82,12 @@ pub @value
 struct BoardSpi
     id: Int
 
+// A CAN controller of the board.  `id` selects the controller; 0 is the
+// one the board's documentation names for `hal.can`.
+pub @value
+struct BoardCan
+    id: Int
+
 // ── GPIO ─────────────────────────────────────────────────────────────
 
 // A GPIO port, driven one pin at a time.  One trait covers both
@@ -146,12 +152,14 @@ pub trait UartTxAsync
 // console input, the transport its log uses.
 pub trait UartRx
     // Waits, polling, until a byte arrives.
+    // cov: skip — waits for a byte of the board's console, which a host test has none to give; the boards' suites run it on the device
     fn read_byte(self) -> Int [hw]
         while true
             let b = hal.uart.try_read_byte()
             if b >= 0
                 return b
 
+    // cov: skip — reads the board's console input, which on a host is the test's standard input, a stream the test does not own; the boards' suites run it on the device
     fn try_read_byte(self) -> ?Int [hw]
         let b = hal.uart.try_read_byte()
         if b < 0
@@ -254,7 +262,6 @@ pub trait I2cBus
     // Reads one register in a single `write_read` transaction.
     fn read_reg(self, addr: Int, reg: Int) -> ?Int [hw]
         match self.write_read(addr, [reg as u8], 1)
-            // cov: skip — runs only on a board whose I2C bus has a device that answers; the boards' suites measure this module on boards with and without one
             Some(buf) => Some(buf[0] as Int)
             None      => None
 
@@ -264,6 +271,173 @@ pub trait I2cBusAsync
     async fn write(self, addr: Int, data: [u8]) -> Bool [hw]
     async fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
     async fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+
+// ── CAN ──────────────────────────────────────────────────────────────
+
+// A classic CAN frame (ISO 11898-1): an identifier of 11 bits, or of 29
+// with `extended`, up to 8 data bytes, and the remote flag, which asks
+// another node for the frame with this identifier and carries no data.
+// `len` is the data length, 0 to 8; a remote frame's `len` is the
+// length it asks for.  `data` holds the bytes, byte 0 in bits 0 to 7
+// and byte 7 in bits 56 to 63, so a frame is a value of five words with
+// no list.  CAN FD, whose frames carry up to 64 bytes, is not here; it
+// would be a trait of its own beside this one.
+pub @value
+struct CanBusFrame
+    id: Int
+    extended: Bool
+    remote: Bool
+    len: Int
+    data: Int
+
+// The controller's error counters and its fault confinement state
+// (ISO 11898-1, clause 12): `tx` and `rx` are the transmit and receive
+// error counters, and `state` is `CAN_ERROR_ACTIVE`, `CAN_ERROR_PASSIVE`
+// (a counter above 127) or `CAN_BUS_OFF` (the transmit counter above
+// 255, the node off the bus).
+pub @value
+struct CanBusErrors
+    tx: Int
+    rx: Int
+    state: Int
+
+// `CanBus.open`'s normal mode: the controller joins the bus.
+pub const CAN_MODE_NORMAL = 0
+
+// `CanBus.open`'s loopback mode: the controller receives the frames it
+// sends, acknowledges them itself and drives nothing onto the bus, so a
+// bench with no other node runs it.
+pub const CAN_MODE_LOOPBACK = 1
+
+// `CanBusErrors.state` of a node with both counters at 127 or below.
+pub const CAN_ERROR_ACTIVE = 0
+
+// `CanBusErrors.state` of a node with a counter above 127, which sends
+// passive error flags.
+pub const CAN_ERROR_PASSIVE = 1
+
+// `CanBusErrors.state` of a node whose transmit counter passed 255,
+// off the bus until it recovers.
+pub const CAN_BUS_OFF = 2
+
+// A CAN controller, classic frames only.  `open` starts the controller
+// at `bitrate` bits a second in `mode` and answers whether it took
+// them: a rate its clock cannot make, or a mode it does not have, is
+// refused.  `send` hands a frame to the controller and answers whether
+// it took it; a frame that is not valid (`can_frame_valid`) is refused
+// before it reaches the controller.  `receive` answers the next frame
+// received, or `None` at once when none waits.  `tx_done` answers
+// whether the controller holds no frame still waiting for the bus, so a
+// frame `send` took has been sent or the controller has none; it is
+// false before `open`.  `bitrate` answers the
+// rate the controller runs at, read back from its timing registers, 0
+// before `open`.  `errors` reads the error counters.
+//
+// The bodies forward to `hal.can`, whose operations carry a frame as
+// integers: the identifier, the flags (`can_flags`), the length and the
+// data, and on a receive the header word `can_header` writes and
+// `can_frame_of` reads, then the data.
+pub trait CanBus
+    fn open(self, bitrate: Int, mode: Int) -> Bool [hw]
+        hal.can.open(bitrate, mode)
+
+    fn send(self, f: CanBusFrame) -> Bool [hw]
+        if not can_frame_valid(f)
+            return false
+        hal.can.send(f.id, can_flags(f), f.len, can_payload(f))
+
+    fn receive(self) -> ?CanBusFrame [hw]
+        let h = hal.can.receive()
+        if h < 0
+            return None
+        // cov: skip — runs once the board's CAN controller has received a frame; a host has no controller, and the FRDM-MCXN947's suite runs it on the device
+        Some(can_frame_of(h, hal.can.rx_data()))
+
+    fn tx_done(self) -> Bool [hw]
+        hal.can.tx_done()
+
+    fn bitrate(self) -> Int [hw]
+        hal.can.bitrate()
+
+    fn errors(self) -> CanBusErrors [hw]
+        can_errors_of(hal.can.errors())
+
+// A data frame with an 11-bit identifier: `len` bytes of `data`, byte 0
+// in its low bits.
+//
+// ```novo
+// use embedded_hal
+//
+// fn main() [io]
+//     let f = embedded_hal.can_data(0x123, 2, 0xBEEF)
+//     println("${embedded_hal.can_byte(f, 0)} ${embedded_hal.can_byte(f, 1)}")   // 239 190
+// ```
+pub fn can_data(id: Int, len: Int, data: Int) -> CanBusFrame
+    CanBusFrame { id: id, extended: false, remote: false, len: len, data: data }
+
+// A data frame with a 29-bit identifier.
+pub fn can_data_ext(id: Int, len: Int, data: Int) -> CanBusFrame
+    CanBusFrame { id: id, extended: true, remote: false, len: len, data: data }
+
+// A remote frame asking for `len` bytes of the frame `id`.
+pub fn can_remote(id: Int, extended: Bool, len: Int) -> CanBusFrame
+    CanBusFrame { id: id, extended: extended, remote: true, len: len, data: 0 }
+
+// Byte `i` of the frame's data, 0 for a byte past its length.
+pub fn can_byte(f: CanBusFrame, i: Int) -> Int
+    if i < 0 or i >= f.len or f.remote
+        return 0
+    int.shr_logical(f.data, i * 8) & 0xFF
+
+// Whether a bus carries the frame: the identifier fits its width and
+// the length is 0 to 8.
+pub fn can_frame_valid(f: CanBusFrame) -> Bool
+    let top = if f.extended
+        0x1FFFFFFF
+    else
+        0x7FF
+    f.id >= 0 and f.id <= top and f.len >= 0 and f.len <= 8
+
+// The data bytes a frame carries on the bus: its first `len` bytes, and
+// none for a remote frame.
+pub fn can_payload(f: CanBusFrame) -> Int
+    if f.remote or f.len <= 0
+        return 0
+    if f.len >= 8
+        return f.data
+    f.data & (int.shl(1, f.len * 8) - 1)
+
+// The flags word of `hal.can.send`: bit 0 an extended identifier, bit 1
+// a remote frame.
+pub fn can_flags(f: CanBusFrame) -> Int
+    var fl = 0
+    if f.extended
+        fl = fl | 1
+    if f.remote
+        fl = fl | 2
+    fl
+
+// The header word of `hal.can.receive`: the length in bits 0 to 3, the
+// flags in bits 4 and 5, the identifier from bit 8.
+pub fn can_header(f: CanBusFrame) -> Int
+    (f.len & 0xF) | int.shl(can_flags(f), 4) | int.shl(f.id, 8)
+
+// The frame a header word and a data word describe.
+pub fn can_frame_of(header: Int, data: Int) -> CanBusFrame
+    let fl = int.shr_logical(header, 4) & 3
+    let f = CanBusFrame { id: int.shr_logical(header, 8) & 0x1FFFFFFF,
+                          extended: (fl & 1) != 0, remote: (fl & 2) != 0,
+                          len: header & 0xF, data: data }
+    CanBusFrame { id: f.id, extended: f.extended, remote: f.remote, len: f.len,
+                  data: can_payload(f) }
+
+// The counters `hal.can.errors` packs into one word: the transmit
+// counter in bits 0 to 7, the receive one in bits 8 to 15, the state in
+// bits 16 and 17, where 3 reads as bus-off as 2 does.
+pub fn can_errors_of(word: Int) -> CanBusErrors
+    let st = int.shr_logical(word, 16) & 3
+    CanBusErrors { tx: word & 0xFF, rx: int.shr_logical(word, 8) & 0xFF,
+                   state: (if st >= CAN_BUS_OFF then CAN_BUS_OFF else st) }
 
 // ── ADC ──────────────────────────────────────────────────────────────
 
@@ -473,3 +647,5 @@ impl AsyncDeadline[hw] for BoardTimer
 impl I2cBus for BoardI2c
 
 impl SpiBus for BoardSpi
+
+impl CanBus for BoardCan
