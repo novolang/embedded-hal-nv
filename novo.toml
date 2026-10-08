@@ -1,6 +1,6 @@
 [package]
 name        = "embedded-hal-nv"
-version     = "0.3.1"
+version     = "0.3.2"
 description = "The peripheral traits a device program is written against: GPIO, UART, timers, SPI, I2C, CAN, ADC, PWM, block storage and the watchdog, each as a sync trait and, where the hardware completes in the background, an async one, plus the awaitable form a microcontroller awaits.  The traits forward to the board's hal hooks, and the package implements them for the board's handles, so one program builds for every board and no board writes an implementation."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -14,7 +14,7 @@ maintainers = ["novo-lang"]
 # bodies of CanBus call.  The bodies of Watchdog and reset_reason call
 # hal.watchdog, which a toolchain built from the novo-lang repository's
 # main has, and the first release after 0.19.3 carries.
-novo        = ">= 0.19.3"
+novo        = ">= 0.19.4"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

@@ -5,6 +5,12 @@ All notable changes to embedded-hal-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.3.2 — 2026-10-08
+
+The toolchain floor is 0.19.4, which carries `hal.watchdog`; 0.3.1 named
+0.19.3, whose toolchain has no such module, so its Watchdog bodies could
+not build there, and 0.3.1 is withdrawn.  No signature changed.
+
 ## 0.3.1 — 2026-10-08
 
 The chip's watchdog, and why the chip last reset.
