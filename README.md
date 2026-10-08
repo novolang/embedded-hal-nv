@@ -25,7 +25,9 @@ general-purpose input/output (GPIO) port, a universal asynchronous
 receiver-transmitter (UART), a timer, a serial peripheral interface
 (SPI) or inter-integrated circuit (I2C) bus, a controller area network
 (CAN) controller, an analogue-to-digital converter (ADC), a pulse-width
-modulation (PWM) channel, or a block of storage. Most peripheral kinds have two traits here:
+modulation (PWM) channel, a block of storage, or a watchdog, a counter
+that resets the chip unless the program feeds it in time. Most
+peripheral kinds have two traits here:
 
 - a **sync** trait, whose methods return when the operation is done,
   waiting by spinning the core if they must;
@@ -44,9 +46,9 @@ the operation on a `Future` the caller owns, which the peripheral's
 interrupt completes and the caller awaits.
 
 A **board** is a particular circuit around a chip, such as the
-nRF52840-DK. The package declares six **handles** that name a board's
+nRF52840-DK. The package declares seven **handles** that name a board's
 peripherals without naming the board: `BoardGpio`, `BoardUart`,
-`BoardTimer`, `BoardI2c`, `BoardSpi` and `BoardCan`. A handle is a struct with one field, `id`, which selects
+`BoardTimer`, `BoardI2c`, `BoardSpi`, `BoardCan` and `BoardWatchdog`. A handle is a struct with one field, `id`, which selects
 the instance of the peripheral (0 for the first). It holds no other
 state, since the state is in the peripheral's registers, so building
 one allocates nothing.
@@ -99,7 +101,7 @@ fn main() [hw]
 
 | Module | What is in it |
 | --- | --- |
-| `embedded_hal` | The six board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, and the sync trait for CAN with its frame, `CanBusFrame`, and its counters, `CanBusErrors`; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus`, `SpiBus` and `CanBus` for the handles. |
+| `embedded_hal` | The seven board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, the sync trait for CAN with its frame, `CanBusFrame`, and its counters, `CanBusErrors`, and the sync trait for the watchdog, `Watchdog`, with `reset_reason()` and its `RESET_*` values; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus`, `SpiBus`, `CanBus` and `Watchdog` for the handles. |
 
 | Peripheral | Handle | Sync trait | Async trait | Awaitable trait |
 | --- | --- | --- | --- | --- |
@@ -110,6 +112,7 @@ fn main() [hw]
 | SPI | `BoardSpi` | `SpiBus` | `SpiBusAsync` | — |
 | I2C | `BoardI2c` | `I2cBus` | `I2cBusAsync` | — |
 | CAN | `BoardCan` | `CanBus` | — | — |
+| Watchdog | `BoardWatchdog` | `Watchdog` | — | — |
 | ADC | — | `Adc` | `AdcAsync` | — |
 | PWM | — | `Pwm` | — | — |
 | Block storage | — | `BlockDevice` | `BlockDeviceAsync` | `AsyncBlock` |
@@ -120,7 +123,8 @@ program's own on a host, since a handle is a `@value` struct and an
 `async fn` takes none. PWM has no async trait: a register write sets
 the duty cycle and there is no completion to wait for. CAN has no
 `async fn` trait either, since its frame is a `@value` struct; a program
-polls `receive` and `tx_done`.
+polls `receive` and `tx_done`. The watchdog has no async trait: feeding
+it is a register write that completes at once.
 
 ## How to choose an entry point
 
@@ -155,25 +159,32 @@ polls `receive` and `tx_done`.
    at once when no frame waits. `CanBus.open` refuses a bit rate the
    controller's clock cannot give exactly. `CAN_MODE_LOOPBACK` receives
    every frame sent and drives nothing onto the bus.
-6. An awaitable arm takes the caller's Future and answers 0 when the
+6. `Watchdog.start` refuses a timeout of 0 or less and one past the
+   longest the watchdog holds, and `timeout_ms` reads back what the
+   hardware was set to, which its steps round. A watchdog that cannot be
+   stopped once started answers `false` from `can_stop` and refuses
+   `stop`; nothing but a reset stops it. `reset_reason()` answers why the
+   chip last reset, `RESET_WATCHDOG` after the watchdog's reset, and
+   `RESET_OTHER` on a chip that cannot tell.
+7. An awaitable arm takes the caller's Future and answers 0 when the
    operation is armed and a negative value when it is refused. The
    caller makes its Futures once, with `core.rt.future_new()`, and sets
    one back to pending with `core.rt.future_reset(f)` before the next
    arm, so the arm allocates nothing and a `@no_alloc` task can call it.
    An awaitable source holds one operation at a time, because the
    hardware has one, and refuses a second arm.
-7. Every `*_arm` has an inverse, `*_disarm`. It answers `true` when the
+8. Every `*_arm` has an inverse, `*_disarm`. It answers `true` when the
    operation was still armed and the source has let go of the Future,
    which the caller may then release. It answers `false` when nothing
    was armed or the interrupt already resolved the Future, which the
    caller should read. `core.rt.future_cancel` alone does not tell the
    peripheral, which would later resolve a released Future.
-8. `*_irqs` counts the interrupts a source has taken. A board whose
+9. `*_irqs` counts the interrupts a source has taken. A board whose
    implementation completes the operation before the arm returns
    reports 0.
-9. Two kinds of method have a body. Those of `GpioOut`, `UartTx`,
-   `UartRx`, `Timer`, `AsyncRead`, `AsyncDeadline`, `I2cBus`, `SpiBus`
-   and `CanBus` that name one operation forward to the board's `hal.*`
+10. Two kinds of method have a body. Those of `GpioOut`, `UartTx`,
+   `UartRx`, `Timer`, `AsyncRead`, `AsyncDeadline`, `I2cBus`, `SpiBus`,
+   `CanBus` and `Watchdog` that name one operation forward to the board's `hal.*`
    hook, which is how the handles are implemented; `CanBus.send` and
    `receive` also pack and unpack the frame for `hal.can`. Five more are written over the trait's own
    methods: `UartTx.write_bytes` writes each byte with `write_byte`,
@@ -181,11 +192,11 @@ polls `receive` and `tx_done`.
    `Adc.read_mv` converts `read_raw` for a 3.3 V reference and a 12-bit
    count, and `I2cBus.write_reg` and `read_reg` are one `write` and one
    `write_read`.
-10. A type of a program's own, such as a driver for a device on a bus or
+11. A type of a program's own, such as a driver for a device on a bus or
    a test double, writes every method of a trait it implements. A
    method it leaves out takes the trait's body, which for the forwarding
    methods drives the board's peripheral and not the type's.
-11. `BlockDevice.read_block` and `write_block` move a block through a
+12. `BlockDevice.read_block` and `write_block` move a block through a
    `Vec[u8; 512]` the caller owns and passes as a `var` argument:
    `read_block` replaces its contents with the block's bytes. Neither
    side allocates.

@@ -5,6 +5,34 @@ All notable changes to embedded-hal-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.3.1 — 2026-10-08
+
+The chip's watchdog, and why the chip last reset.
+
+### Added
+
+- **`Watchdog`**, a trait for a watchdog: `start(timeout_ms)` arms it
+  and answers whether it took the timeout; `feed()` restarts the count;
+  `timeout_ms()` reads back the timeout the hardware was set to, which
+  its counter's steps round; `can_stop()` answers whether the watchdog
+  can be stopped once started, and `stop()` stops it, refused where it
+  cannot.  Every method forwards to the standard library's
+  `hal.watchdog`, which the build generates over the watchdog a board
+  names with `@hal(watchdog)`; on a board that names none, a start is
+  refused.
+- **`BoardWatchdog`**, the handle for the chip's watchdog, and the
+  implementation of `Watchdog` for it.
+- **`reset_reason()`**, why the chip last reset, as one of
+  `RESET_OTHER`, `RESET_POWER_ON`, `RESET_PIN`, `RESET_WATCHDOG` and
+  `RESET_SOFTWARE`, from `hal.watchdog.reset_reason()`, which the
+  board's family runtime answers.
+- `tests/watchdog_tests.nv`, the trait's bodies on the host and a
+  watchdog of a program's own.
+
+No signature of 0.3.0 changed.  The toolchain floor stays 0.19.3; the
+bodies of the additions need `hal.watchdog`, which the release after
+0.19.3 carries.
+
 ## 0.3.0 — 2026-10-08
 
 A CAN controller, classic frames only.

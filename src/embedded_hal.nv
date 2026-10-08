@@ -4,7 +4,7 @@
 //
 // A program that writes `use embedded_hal` names a peripheral by its
 // handle (`BoardGpio`, `BoardUart`, `BoardTimer`, `BoardI2c`,
-// `BoardSpi`, `BoardCan`) and calls it through
+// `BoardSpi`, `BoardCan`, `BoardWatchdog`) and calls it through
 // the traits below.  A method a trait gives a body to forwards to the
 // standard library's `hal.*` hook of the same operation (`GpioOut.set`
 // calls `hal.gpio.set`), and the hook is the board's: the build links
@@ -86,6 +86,12 @@ struct BoardSpi
 // one the board's documentation names for `hal.can`.
 pub @value
 struct BoardCan
+    id: Int
+
+// The chip's watchdog.  `id` selects the watchdog; 0 is the one the
+// board's documentation names for `hal.watchdog`.
+pub @value
+struct BoardWatchdog
     id: Int
 
 // ── GPIO ─────────────────────────────────────────────────────────────
@@ -439,6 +445,72 @@ pub fn can_errors_of(word: Int) -> CanBusErrors
     CanBusErrors { tx: word & 0xFF, rx: int.shr_logical(word, 8) & 0xFF,
                    state: (if st >= CAN_BUS_OFF then CAN_BUS_OFF else st) }
 
+// ── Watchdog ─────────────────────────────────────────────────────────
+
+// A watchdog: a counter that resets the chip unless the program feeds
+// it before the timeout.  `start` arms it with the timeout in
+// milliseconds and answers whether the watchdog took it: a timeout of 0
+// or less, or past the longest the watchdog holds, is refused, and so
+// is a second start with another timeout on a watchdog whose timeout is
+// fixed once it runs.  `feed` restarts the count.  `timeout_ms` answers
+// the timeout the hardware was set to, which its counter's steps round,
+// read back from its registers at its clock's nominal rate; 0 before
+// `start`.  A watchdog that cannot be stopped once started answers
+// `false` from `can_stop`, and `stop` is refused there; elsewhere `stop`
+// stops it and answers `true`.
+//
+// The bodies forward to `hal.watchdog`, which the build generates over
+// the watchdog a board names with `@hal(watchdog)`.  On a board that
+// names none, and on a host, a start is refused and the timeout reads 0.
+pub trait Watchdog
+    fn start(self, timeout_ms: Int) -> Bool [hw]
+        hal.watchdog.start(timeout_ms)
+
+    fn feed(self) [hw]
+        hal.watchdog.feed()
+
+    fn timeout_ms(self) -> Int [hw]
+        hal.watchdog.timeout_ms()
+
+    fn can_stop(self) -> Bool [hw]
+        hal.watchdog.can_stop()
+
+    fn stop(self) -> Bool [hw]
+        hal.watchdog.stop()
+
+// `reset_reason()` after a reset whose cause the chip cannot tell, or
+// one that is none of the others, such as a brown-out or a lock-up.
+pub const RESET_OTHER = 0
+
+// `reset_reason()` after the power came on.
+pub const RESET_POWER_ON = 1
+
+// `reset_reason()` after the reset pin.
+pub const RESET_PIN = 2
+
+// `reset_reason()` after a watchdog reset the chip.
+pub const RESET_WATCHDOG = 3
+
+// `reset_reason()` after a reset the software asked for, which on most
+// chips is also what a debugger's reset is.
+pub const RESET_SOFTWARE = 4
+
+// Why the chip last reset: one of the `RESET_*` values.  The board's
+// family runtime reads the chip's reset-reason register before anything
+// else can clear it; a host answers `RESET_OTHER`.
+//
+// ```novo
+// use embedded_hal
+//
+// fn main() [io, hw]
+//     if embedded_hal.reset_reason() == embedded_hal.RESET_WATCHDOG
+//         println("the watchdog reset the chip")
+//     else
+//         println("started")   // started
+// ```
+pub fn reset_reason() -> Int [hw]
+    hal.watchdog.reset_reason()
+
 // ── ADC ──────────────────────────────────────────────────────────────
 
 // An analogue-to-digital converter.  `read_raw` returns the converter's
@@ -649,3 +721,5 @@ impl I2cBus for BoardI2c
 impl SpiBus for BoardSpi
 
 impl CanBus for BoardCan
+
+impl Watchdog for BoardWatchdog

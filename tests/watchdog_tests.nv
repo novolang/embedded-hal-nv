@@ -1,0 +1,86 @@
+// watchdog_tests — `Watchdog`, `BoardWatchdog` and `reset_reason`, run
+// on the host.
+//
+// The trait's bodies forward to `hal.watchdog`, which on a host answers
+// as absent hardware: a start is refused, the timeout reads 0, the
+// watchdog cannot be stopped and a stop is refused, and the last reset's
+// reason is other.  A watchdog of a program's own, a test double that
+// counts its feeds, writes every method, as a driver for a watchdog on a
+// bus would.
+
+use std.test
+use embedded_hal
+
+// ── The board's watchdog on a host ───────────────────────────────────
+
+@test
+fn test_board_watchdog_reaches_the_hook() [io, hw]
+    let dog = BoardWatchdog { id: 0 }
+    test.assert(not dog.start(1000))
+    dog.feed()
+    test.assert(dog.timeout_ms() == 0)
+    test.assert(not dog.can_stop())
+    test.assert(not dog.stop())
+
+@test
+fn test_the_host_reads_its_reset_as_other() [io, hw]
+    test.assert(embedded_hal.reset_reason() == embedded_hal.RESET_OTHER)
+
+@test
+fn test_the_reasons_are_five_values() [io]
+    test.assert(embedded_hal.RESET_OTHER == 0)
+    test.assert(embedded_hal.RESET_POWER_ON == 1)
+    test.assert(embedded_hal.RESET_PIN == 2)
+    test.assert(embedded_hal.RESET_WATCHDOG == 3)
+    test.assert(embedded_hal.RESET_SOFTWARE == 4)
+
+// ── A watchdog of a program's own ────────────────────────────────────
+
+// A watchdog that holds timeouts in steps of `step` ms up to `longest`,
+// and can be stopped when `stoppable` is set.  It keeps no state, so it
+// answers what a watchdog started with `asked` would.
+@value
+struct Stepped
+    step: Int
+    longest: Int
+    stoppable: Bool
+    asked: Int
+
+impl Watchdog for Stepped
+    fn start(self, timeout_ms: Int) -> Bool [hw]
+        timeout_ms > 0 and timeout_ms <= self.longest
+
+    fn feed(self) [hw]
+        pass
+
+    fn timeout_ms(self) -> Int [hw]
+        if self.asked <= 0
+            return 0
+        (self.asked + self.step / 2) / self.step * self.step
+
+    fn can_stop(self) -> Bool [hw]
+        self.stoppable
+
+    fn stop(self) -> Bool [hw]
+        self.stoppable
+
+// Arms any `Watchdog` and answers the timeout it read back, or -1 when
+// the start was refused.
+fn arm<W: Watchdog>(dog: W, ms: Int) -> Int [hw]
+    if not dog.start(ms)
+        return -1
+    dog.feed()
+    dog.timeout_ms()
+
+@test
+fn test_a_watchdog_of_a_program_s_own_rounds_and_refuses() [io, hw]
+    let dog = Stepped { step: 64, longest: 8000, stoppable: false, asked: 1000 }
+    test.assert(arm(dog, 1000) == 1024)
+    test.assert(arm(dog, 0) == -1)
+    test.assert(arm(dog, 9000) == -1)
+    test.assert(not dog.can_stop())
+    test.assert(not dog.stop())
+    let free = Stepped { step: 1, longest: 8000, stoppable: true, asked: 0 }
+    test.assert(free.timeout_ms() == 0)
+    test.assert(free.can_stop())
+    test.assert(free.stop())
