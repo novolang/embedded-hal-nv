@@ -101,7 +101,7 @@ fn main() [hw]
 
 | Module | What is in it |
 | --- | --- |
-| `embedded_hal` | The seven board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, the sync trait for CAN with its frame, `CanBusFrame`, and its counters, `CanBusErrors`, and the sync trait for the watchdog, `Watchdog`, with `reset_reason()` and its `RESET_*` values; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus`, `SpiBus`, `CanBus` and `Watchdog` for the handles. |
+| `embedded_hal` | The seven board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, the sync trait for CAN with its frame, `CanBusFrame`, and its counters, `CanBusErrors`, and the sync trait for the watchdog, `Watchdog`, with `reset_reason()` and its `RESET_*` values; the traits for an I2S interface and a PDM input, `I2s` and `PdmIn`, with their async forms, their settings and the arithmetic of the settings; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus`, `SpiBus`, `CanBus` and `Watchdog` for the handles. |
 
 | Peripheral | Handle | Sync trait | Async trait | Awaitable trait |
 | --- | --- | --- | --- | --- |
@@ -113,6 +113,8 @@ fn main() [hw]
 | I2C | `BoardI2c` | `I2cBus` | `I2cBusAsync` | — |
 | CAN | `BoardCan` | `CanBus` | — | — |
 | Watchdog | `BoardWatchdog` | `Watchdog` | — | — |
+| I2S | — | `I2s` | `I2sAsync` | — |
+| PDM input | — | `PdmIn` | `PdmInAsync` | — |
 | ADC | — | `Adc` | `AdcAsync` | — |
 | PWM | — | `Pwm` | — | — |
 | Block storage | — | `BlockDevice` | `BlockDeviceAsync` | `AsyncBlock` |
@@ -124,7 +126,61 @@ program's own on a host, since a handle is a `@value` struct and an
 the duty cycle and there is no completion to wait for. CAN has no
 `async fn` trait either, since its frame is a `@value` struct; a program
 polls `receive` and `tx_done`. The watchdog has no async trait: feeding
-it is a register write that completes at once.
+it is a register write that completes at once. `I2s` and `PdmIn` have
+no handle and no body yet; the next section says why.
+
+## I2S and PDM
+
+**I2S** is a synchronous serial link for digital audio. Three lines
+carry it: a bit clock, a word clock with one period per frame, and a
+data line. A frame holds one sample for each channel, left first. A
+codec, a digital microphone or an amplifier sits on the far end.
+**PDM** is the link of the cheapest microphones: the chip drives a clock
+and the microphone answers one bit per clock, at a density that follows
+the sound, which a filter turns into samples.
+
+`I2s` configures an interface (`I2sConfig`: the sample rate, the bit
+depth, one or two channels, master or slave, and Philips or
+left-justified framing), starts and stops its clocks, and moves samples
+through a `Vec[i32; 256]` the caller owns and passes as a `var`
+argument, as `BlockDevice` moves a block. `PdmIn` configures a PDM input
+(`PdmConfig`: the clock, the PCM sample rate, the channels and the edge
+the left microphone is read on), starts and stops it, and receives PCM
+samples. Each has an async form for a host's scheduler. A sample is a
+signed integer in the low bits of an `Int`, sign-extended, whatever
+alignment the hardware's slot wants; that alignment is the
+implementation's.
+
+The shape was read from the following, and nothing was ported:
+
+- Nordic's nRF I2S and PDM peripherals, through nrfx's `nrfx_i2s.h` and
+  `nrfx_pdm.h` and Zephyr's `i2s_nrfx.c` and `dmic_nrfx_pdm.c`: master or
+  slave, I2S or aligned format, a sample width of 8, 16 or 24 bits, stereo
+  or one channel, and a clock tree that rounds the requested rate, which is
+  why `sample_rate` reads the rate back. The PDM block takes a clock and a
+  ratio to the output rate, an edge for the left channel and hands back
+  16-bit samples.
+- Zephyr's `i2s` and `dmic` driver classes (`i2s.h`, `dmic.h`): a word
+  size, a channel count, a frame clock frequency, a format and a master or
+  slave option; under- and overruns are errors the stream reports, which
+  `xruns` counts.
+- The STM32 SAI, through ST's `stm32wbaxx_hal_sai.h` and
+  `stm32u3xx_hal_sai.h`: an audio mode (master or slave, transmit or
+  receive), a protocol, a data size, a mono or stereo mode and, for PDM, a
+  number of microphone pairs. The SAI's slots, frame length and
+  synchronisation between blocks are richer than this trait and are left to
+  the board's driver.
+- The RP2350's I2S, which is a PIO program and a DMA channel, was **not**
+  read: no source for it was at hand. The trait asks only for what a PIO
+  program can give, a clock rate and a buffer of words, and the first RP2350
+  driver will show whether it asks too much.
+
+**No board implements `I2s` or `PdmIn` yet.** The traits have no bodies
+and there is no `BoardI2s` handle, because no `hal.i2s` hook exists to
+forward to. That hook, the pins of each board, and the master clock a
+codec wants are the board support packages' next step. Until then a
+program or a test implements the traits for a type of its own, as
+`tests/i2s_tests.nv` does.
 
 ## How to choose an entry point
 
@@ -134,6 +190,9 @@ it is a register write that completes at once.
   (`<B: I2cBus>`), so they work on any board and with a test double,
   and holds the board's bus, a `BoardI2c` or a `BoardSpi`, in the type
   a program uses.
+- A driver for an audio codec, a digital microphone or an amplifier
+  takes an `I2s` or a `PdmIn` for its data path and a bus for its
+  registers, and lets the program configure the data path.
 - A program that waits for a peripheral at `@tier(embedded)` uses the
   awaitable traits. The `async fn` traits are for a host's scheduler.
 
@@ -200,6 +259,24 @@ it is a register write that completes at once.
    `Vec[u8; 512]` the caller owns and passes as a `var` argument:
    `read_block` replaces its contents with the block's bytes. Neither
    side allocates.
+13. `I2s.configure` answers `false` for settings the interface cannot
+   make: a depth or channel count it lacks, a role it cannot play, or a
+   rate its dividers cannot reach. `sample_rate` reads back the rate the
+   peripheral runs at, which the dividers round, and is 0 before a
+   configure that was taken. `i2s_config_valid` is the least an interface
+   refuses, and `i2s_bclk_hz` is the bit clock a slave must be given.
+14. `transmit` and `receive` answer the samples they moved, or -1 when the
+   interface is not configured and enabled, or `n` is past
+   `I2S_BUFFER_SAMPLES`. A receive replaces the buffer's contents. A
+   stereo buffer alternates left and right, starting with left. `xruns`
+   counts the buffers lost since `enable`, to an underrun on a transmit or
+   an overrun on a receive.
+15. `PdmIn` hands back 16-bit PCM samples, so the decimation is the
+   peripheral's and not the caller's. `configure` answers `false` unless the
+   clock is a whole multiple of the sample rate (`pdm_decimation`) and the
+   peripheral has that ratio. A microphone needs some milliseconds after
+   `enable` before its output is valid; the microphone's driver knows how
+   many.
 
 ## Running on a microcontroller
 
@@ -237,6 +314,8 @@ own beside the copies inlined at their calls.
   carries them, because the registers differ from chip to chip.
 - A trait for interrupts. An interrupt handler is a function marked
   `@isr(<line>)`, whose signature is fixed by the hardware.
+- A board implementation of `I2s` and `PdmIn`: a `hal.i2s` hook, a
+  handle and the pin maps (see the I2S and PDM section).
 - A trait for DMA descriptors. An async implementation uses whatever
   DMA the chip has, and the trait shows only the result.
 - USB, Ethernet and radio traits. Each is large enough to need its own
@@ -257,6 +336,10 @@ calls and with what value, and what `read_reg` and `read_mv` answer.
 a pin as 0, refuse an arm with -1 and acknowledge no I2C write, so the
 answers show each call reached the hook; arms one Future again and again with
 `core.rt.future_reset`; and reads blocks into a caller's buffer.
+`tests/i2s_tests.nv` implements `I2s`, `PdmIn` and their async forms for
+types of its own, a stereo link and a pair of PDM microphones, and runs a
+speaker driver, a recorder and a capture written against the traits alone,
+then checks the settings' arithmetic.
 `tests/can_tests.nv` checks the CAN frame and its words, the board's
 controller on a host, which refuses the open and receives nothing, and
 `CanBus` over a bus of a program's own. Each

@@ -511,6 +511,197 @@ pub const RESET_SOFTWARE = 4
 pub fn reset_reason() -> Int [hw]
     hal.watchdog.reset_reason()
 
+// ── I2S and PDM ──────────────────────────────────────────────────────
+
+// Whether the chip drives the bit clock and the word clock (`I2sMaster`)
+// or the other side does (`I2sSlave`).  A codec that is the clock
+// master makes the chip a slave.
+pub @value
+enum I2sRole
+    I2sMaster
+    I2sSlave
+
+// How a frame is laid out on the data line.  `I2sPhilips` is the I2S
+// standard of Philips (NXP): the word clock changes one bit clock
+// before the first bit of a word.  `I2sLeftJustified` starts the first
+// bit with the word clock's edge.  Most codecs and microphones take
+// either; the two sides must agree.
+pub @value
+enum I2sFormat
+    I2sPhilips
+    I2sLeftJustified
+
+// The settings of one I2S interface.  `sample_rate` is the word clock
+// in hertz, one frame per period; `bit_depth` is the bits of a sample,
+// 8, 16, 24 or 32; `channels` is the samples of a frame, 1 or 2.
+pub @value
+struct I2sConfig
+    sample_rate: Int
+    bit_depth: Int
+    channels: Int
+    role: I2sRole
+    format: I2sFormat
+
+// The number of samples one buffer of `I2s` or `PdmIn` holds.  A buffer
+// is `Vec[i32; 256]`; at 48 kHz stereo one buffer is 128 frames, 2.7 ms.
+pub const I2S_BUFFER_SAMPLES = 256
+
+// The edge of the PDM clock on which the left channel's bit is valid;
+// the right channel's is the other edge.  Two microphones share one data
+// line and are told apart by this edge, which each strapping pin picks.
+pub @value
+enum PdmEdge
+    PdmLeftFalling
+    PdmLeftRising
+
+// The settings of one PDM input.  `clock_hz` is the bit clock the
+// peripheral drives to the microphones, typically 1 to 3.2 MHz;
+// `sample_rate` is the rate of the PCM samples it hands back, the
+// clock divided by a decimation ratio the peripheral picks; `channels`
+// is 1 or 2.
+pub @value
+struct PdmConfig
+    clock_hz: Int
+    sample_rate: Int
+    channels: Int
+    edge: PdmEdge
+
+// An I2S interface, the chip's synchronous serial link for digital
+// audio between itself and a codec, a microphone or an amplifier.
+//
+// Three lines carry it: the bit clock (SCK), the word clock (WS, also
+// called LRCK), which has one period per frame, and the data line or
+// lines.  A frame holds one sample per channel, left channel first.
+// Some codecs also need a master clock (MCLK), a multiple of the word
+// clock, which the board's pin map and the peripheral's driver supply,
+// and the trait does not name.
+//
+// A sample is a signed integer in the low `bit_depth` bits of an `Int`,
+// sign-extended; a stereo buffer alternates left and right, so sample
+// 2k is the left channel of frame k.  Whatever alignment the hardware's
+// 32-bit slot wants (the nRF's, the STM32's) is the implementation's.
+//
+// `configure` stores the settings and answers whether the peripheral
+// took them: a depth or a channel count it does not have, a role it
+// cannot play, or a rate its clock tree cannot make is refused.
+// `sample_rate` answers the word clock the peripheral runs at, read
+// back from its dividers; it differs from the request by the divider's
+// rounding, and is 0 before a `configure` that was taken.  `enable`
+// starts the clocks, as a master, and the data line; `disable` stops
+// them.  A codec is configured over its own bus while `enable` is on,
+// because it needs the clocks to run before its registers are final.
+//
+// `transmit` sends the samples `buf` holds and `receive` replaces
+// `buf` with `n` received samples.  Each answers the number of samples
+// it moved, which is `buf.len()` for a transmit, or -1 when the
+// interface was refused: not configured, not enabled, or `n` above
+// `I2S_BUFFER_SAMPLES`.  Both return when the samples are queued or
+// received, not when the last bit has left the pin.  `xruns` counts the
+// buffers lost since `enable`: a transmit that found the peripheral out
+// of samples (underrun) and a receive that found it full (overrun).
+// The buffer is the caller's: nothing allocates, and a caller at the
+// embedded tier keeps it in its own frame.
+//
+// No board implements this trait yet; the `hal.i2s` hook that would give
+// the bodies belongs to the board support packages.  A program or a
+// test writes every method for its own type.
+pub trait I2s
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+    fn sample_rate(self) -> Int [hw]
+    fn enable(self) -> Bool [hw]
+    fn disable(self) [hw]
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+    fn xruns(self) -> Int [hw]
+
+// The I2S transfers on a host's scheduler: each parks the task until
+// the peripheral has queued or completed the buffer.  `transmit`
+// answers the samples sent, `receive` the `n` samples received, and a
+// refused one answers -1 or an empty list.  Configuration goes through
+// the sync trait, which an implementation has beside this one.
+pub trait I2sAsync
+    async fn transmit(self, buf: [i32]) -> Int [hw]
+    async fn receive(self, n: Int) -> [i32] [hw]
+
+// A PDM input, the chip's receiver for pulse-density-modulated
+// microphones.  A PDM microphone has a clock input and a data output
+// that carries one bit per clock, at a density that follows the sound;
+// the peripheral drives the clock, filters and decimates the bits, and
+// hands back PCM samples.  Where a chip has no PDM block, a PIO program
+// or a timer-driven input does the bit capture and a filter does the
+// rest; the trait asks only for the samples.
+//
+// A sample is a signed 16-bit PCM value, sign-extended in an `Int`; a
+// stereo buffer alternates the left and right channel as `I2s` does.
+// The methods have the meaning of `I2s`' under the same names:
+// `configure` answers whether the clock and the rate are possible (the
+// ratio of the two must be a decimation the peripheral has),
+// `sample_rate` reads back the rate the peripheral runs at, `enable`
+// starts the clock to the microphones and `disable` stops it, and
+// `receive` replaces `buf` with `n` samples, or answers -1 when
+// refused.  `xruns` counts the buffers lost to an overrun since
+// `enable`.  A microphone needs time after `enable` before its output
+// is valid, from a few to some tens of milliseconds, which the driver
+// of the microphone knows.
+pub trait PdmIn
+    fn configure(self, c: PdmConfig) -> Bool [hw]
+    fn sample_rate(self) -> Int [hw]
+    fn enable(self) -> Bool [hw]
+    fn disable(self) [hw]
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+    fn xruns(self) -> Int [hw]
+
+// The PDM input on a host's scheduler: `receive` parks the task until
+// `n` samples have arrived and answers them.
+pub trait PdmInAsync
+    async fn receive(self, n: Int) -> [i32] [hw]
+
+// Whether an I2S interface can be asked for these settings: a positive
+// rate, a depth of 8, 16, 24 or 32 bits, and 1 or 2 channels.  An
+// implementation refuses the settings this refuses, and may refuse more.
+//
+// ```novo
+// use embedded_hal.{ I2sConfig, I2sRole, I2sFormat }
+//
+// fn main() [io]
+//     let c = I2sConfig { sample_rate: 48000, bit_depth: 24, channels: 2,
+//                         role: I2sRole.I2sMaster, format: I2sFormat.I2sPhilips }
+//     println("${embedded_hal.i2s_config_valid(c)}")   // true
+//     println("${embedded_hal.i2s_bclk_hz(c)}")        // 2304000
+// ```
+pub fn i2s_config_valid(c: I2sConfig) -> Bool
+    let depth_ok = c.bit_depth == 8 or c.bit_depth == 16 or c.bit_depth == 24 or c.bit_depth == 32
+    c.sample_rate > 0 and depth_ok and (c.channels == 1 or c.channels == 2)
+
+// The bit clock the settings imply, in hertz: the word clock times the
+// bits of a frame.  A master drives it, a slave must be given it.
+pub fn i2s_bclk_hz(c: I2sConfig) -> Int
+    c.sample_rate * c.bit_depth * c.channels
+
+// Whether a PDM input can be asked for these settings: positive clock
+// and rate with the clock a whole multiple of the rate, and 1 or 2
+// channels.
+pub fn pdm_config_valid(c: PdmConfig) -> Bool
+    c.clock_hz > 0 and c.sample_rate > 0 and c.clock_hz % c.sample_rate == 0
+        and (c.channels == 1 or c.channels == 2)
+
+// The decimation ratio of the settings: how many microphone bits one
+// PCM sample is made from, the clock divided by the rate.  0 for
+// settings `pdm_config_valid` refuses.
+//
+// ```novo
+// use embedded_hal.{ PdmConfig, PdmEdge }
+//
+// fn main() [io]
+//     let c = PdmConfig { clock_hz: 1024000, sample_rate: 16000, channels: 1,
+//                         edge: PdmEdge.PdmLeftFalling }
+//     println("${embedded_hal.pdm_decimation(c)}")   // 64
+// ```
+pub fn pdm_decimation(c: PdmConfig) -> Int
+    if not pdm_config_valid(c)
+        return 0
+    c.clock_hz / c.sample_rate
+
 // ── ADC ──────────────────────────────────────────────────────────────
 
 // An analogue-to-digital converter.  `read_raw` returns the converter's

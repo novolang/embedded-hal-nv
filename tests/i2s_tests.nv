@@ -1,0 +1,334 @@
+// i2s_tests — `I2s` and `PdmIn` with their async forms, and the
+// settings' arithmetic, run on the host.
+//
+// No board implements either trait yet, so the traits have no bodies to
+// forward and there is no handle to call.  A program or a driver reaches
+// the traits through a type of its own, and so do these tests: a stereo
+// codec link that holds its settings in its fields, a PDM microphone
+// pair that answers a ramp, and a speaker driver and a recorder written
+// against the traits alone.  A trait method's receiver is a plain
+// `self`, so a double cannot record its calls; each answers from the
+// fields it was built with.
+
+use std.test
+use embedded_hal.{ I2s, I2sAsync, PdmIn, PdmInAsync, I2sConfig, I2sRole, I2sFormat, PdmConfig, PdmEdge }
+
+// ── An I2S link ──────────────────────────────────────────────────────
+
+// An interface whose clock tree makes the word clocks `rates` and whose
+// samples are `depth` bits at most.  `taken` is the rate it runs at,
+// 0 before a configure it accepted; `running` is whether it is enabled;
+// `lost` is the buffers it reports lost.  A receive answers a ramp that
+// counts up from 1, so a test can tell the samples are the interface's.
+struct Link
+    rates: [Int]
+    depth: Int
+    taken: Int
+    running: Bool
+    lost: Int
+
+fn link() -> Link
+    Link { rates: [8000, 16000, 44100, 48000], depth: 24, taken: 0, running: false, lost: 0 }
+
+impl I2s for Link
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        if not embedded_hal.i2s_config_valid(c) or c.bit_depth > self.depth
+            return false
+        for r in self.rates
+            if r == c.sample_rate
+                return true
+        false
+
+    fn sample_rate(self) -> Int [hw]
+        self.taken
+
+    fn enable(self) -> Bool [hw]
+        self.taken > 0
+
+    fn disable(self) [hw]
+        pass
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        if not self.running
+            return -1
+        buf.len()
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        if not self.running or n < 0 or n > embedded_hal.I2S_BUFFER_SAMPLES
+            return -1
+        buf.clear()
+        for k in 0..n
+            let _ = buf.push((k + 1) as i32)
+        n
+
+    fn xruns(self) -> Int [hw]
+        self.lost
+
+// The async form is a type of its own, so these tests build with a
+// toolchain that predates the arity rule for a call whose type
+// implements a sync and an async method of one name.  A driver that
+// implements both is a type like `Link` with an `impl I2sAsync` beside
+// its `impl I2s`.
+struct AsyncLink
+    running: Bool
+
+impl I2sAsync for AsyncLink
+    async fn transmit(self, buf: [i32]) -> Int [hw]
+        if not self.running
+            return -1
+        buf.len()
+
+    async fn receive(self, n: Int) -> [i32] [hw]
+        var out: [i32] = []
+        if not self.running
+            return out
+        for k in 0..n
+            list.push(out, (k + 1) as i32)
+        out
+
+fn stereo(rate: Int, depth: Int) -> I2sConfig
+    I2sConfig { sample_rate: rate, bit_depth: depth, channels: 2,
+                role: I2sRole.I2sMaster, format: I2sFormat.I2sPhilips }
+
+// A speaker driver written against the trait: it configures the link,
+// starts the clocks, fills a buffer with a square wave of the given
+// half-period in frames and amplitude, sends it, and answers the
+// samples sent, or -1 when any step was refused.
+fn play<I: I2s>(i: I, rate: Int, half: Int, amp: Int) -> Int [hw]
+    if not i.configure(stereo(rate, 16))
+        return -1
+    if not i.enable()
+        return -1
+    var buf: Vec[i32; 256] = Vec.new()
+    for f in 0..128
+        let v = if f / half % 2 == 0
+            amp
+        else
+            0 - amp
+        let _ = buf.push(v as i32)
+        let _ = buf.push(v as i32)
+    let sent = i.transmit(var buf)
+    i.disable()
+    sent
+
+// A recorder written against the trait: it receives `n` samples and
+// answers the largest magnitude, or -1 when the receive was refused.
+fn peak<I: I2s>(i: I, n: Int) -> Int [hw]
+    var buf: Vec[i32; 256] = Vec.new()
+    if i.receive(var buf, n) < 0
+        return -1
+    var top = 0
+    for k in 0..buf.len()
+        let v = buf[k] as Int
+        let m = if v < 0
+            0 - v
+        else
+            v
+        if m > top
+            top = m
+    top
+
+@test
+fn test_configure_answers_whether_the_clock_tree_makes_the_rate() [io, hw]
+    let l = link()
+    test.assert(l.configure(stereo(48000, 24)))
+    test.assert(l.configure(stereo(44100, 16)))
+    // A rate the dividers cannot make, and a depth past the hardware's.
+    test.assert(not l.configure(stereo(96000, 24)))
+    test.assert(not l.configure(stereo(48000, 32)))
+    // Settings that no interface can be asked for.
+    test.assert(not l.configure(stereo(0, 16)))
+
+@test
+fn test_sample_rate_reads_back_what_the_peripheral_runs_at() [io, hw]
+    test.assert(link().sample_rate() == 0)
+    let l = Link { rates: [47994], depth: 24, taken: 47994, running: false, lost: 0 }
+    // The divider rounded 48000 to 47994; the read-back says so.
+    test.assert(l.sample_rate() == 47994)
+
+@test
+fn test_a_speaker_driver_plays_through_the_trait() [io, hw]
+    let l = Link { rates: [48000], depth: 24, taken: 48000, running: true, lost: 0 }
+    // 128 stereo frames are 256 samples.
+    test.assert(play(l, 48000, 16, 12000) == 256)
+    // A rate the link refuses stops the driver before it sends.
+    test.assert(play(l, 96000, 16, 12000) == -1)
+    // An interface that never took a rate cannot be enabled.
+    test.assert(play(Link { rates: [48000], depth: 24, taken: 0, running: false, lost: 0 }, 48000, 16, 12000) == -1)
+
+@test
+fn test_a_transmit_on_a_stopped_interface_is_refused() [io, hw]
+    var buf: Vec[i32; 256] = Vec.new()
+    let _ = buf.push(1 as i32)
+    test.assert(link().transmit(var buf) == -1)
+    let on = Link { rates: [], depth: 24, taken: 48000, running: true, lost: 0 }
+    test.assert(on.transmit(var buf) == 1)
+
+@test
+fn test_a_recorder_reads_the_caller_s_buffer() [io, hw]
+    let on = Link { rates: [], depth: 24, taken: 48000, running: true, lost: 3 }
+    test.assert(peak(on, 100) == 100)
+    test.assert(peak(on, 0) == 0)
+    // A stopped interface, a negative count and one past the buffer.
+    test.assert(peak(link(), 100) == -1)
+    test.assert(peak(on, -1) == -1)
+    test.assert(peak(on, 257) == -1)
+    test.assert(peak(on, embedded_hal.I2S_BUFFER_SAMPLES) == 256)
+    test.assert(on.xruns() == 3)
+
+@test
+fn test_a_receive_replaces_the_buffer_s_contents() [io, hw]
+    let on = Link { rates: [], depth: 24, taken: 48000, running: true, lost: 0 }
+    var buf: Vec[i32; 256] = Vec.new()
+    let _ = buf.push(99 as i32)
+    test.assert(on.receive(var buf, 2) == 2)
+    test.assert(buf.len() == 2)
+    test.assert((buf[0] as Int) == 1)
+    test.assert((buf[1] as Int) == 2)
+
+@test
+fn test_the_async_form_moves_a_list() [io, hw, async]
+    let on = AsyncLink { running: true }
+    test.assert(await on.transmit([1 as i32, 2 as i32, 3 as i32]) == 3)
+    let got = await on.receive(4)
+    test.assert(got.len() == 4)
+    test.assert((got[3] as Int) == 4)
+    // A stopped interface sends nothing and receives nothing.
+    test.assert(await AsyncLink { running: false }.transmit([1 as i32]) == -1)
+    let none = await AsyncLink { running: false }.receive(4)
+    test.assert(none.len() == 0)
+
+// ── The settings ─────────────────────────────────────────────────────
+
+@test
+fn test_valid_settings_are_a_known_depth_and_one_or_two_channels() [io]
+    test.assert(embedded_hal.i2s_config_valid(stereo(48000, 8)))
+    test.assert(embedded_hal.i2s_config_valid(stereo(48000, 16)))
+    test.assert(embedded_hal.i2s_config_valid(stereo(48000, 24)))
+    test.assert(embedded_hal.i2s_config_valid(stereo(48000, 32)))
+    test.assert(not embedded_hal.i2s_config_valid(stereo(48000, 20)))
+    test.assert(not embedded_hal.i2s_config_valid(stereo(-1, 16)))
+    let mono = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 1,
+                           role: I2sRole.I2sSlave, format: I2sFormat.I2sLeftJustified }
+    test.assert(embedded_hal.i2s_config_valid(mono))
+    let three = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 3,
+                            role: I2sRole.I2sSlave, format: I2sFormat.I2sLeftJustified }
+    test.assert(not embedded_hal.i2s_config_valid(three))
+
+@test
+fn test_the_bit_clock_is_rate_times_the_bits_of_a_frame() [io]
+    test.assert(embedded_hal.i2s_bclk_hz(stereo(48000, 24)) == 2304000)
+    test.assert(embedded_hal.i2s_bclk_hz(stereo(16000, 16)) == 512000)
+    let mono = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 1,
+                           role: I2sRole.I2sMaster, format: I2sFormat.I2sPhilips }
+    test.assert(embedded_hal.i2s_bclk_hz(mono) == 256000)
+
+// ── A PDM input ──────────────────────────────────────────────────────
+
+// A pair of PDM microphones behind a peripheral that decimates 64 to
+// one.  `taken` is the rate read back, `running` whether the clock is
+// on.  A receive answers a ramp, as the link's does.
+struct Mics
+    taken: Int
+    running: Bool
+    lost: Int
+
+impl PdmIn for Mics
+    fn configure(self, c: PdmConfig) -> Bool [hw]
+        embedded_hal.pdm_decimation(c) == 64
+
+    fn sample_rate(self) -> Int [hw]
+        self.taken
+
+    fn enable(self) -> Bool [hw]
+        self.taken > 0
+
+    fn disable(self) [hw]
+        pass
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        if not self.running or n < 0 or n > embedded_hal.I2S_BUFFER_SAMPLES
+            return -1
+        buf.clear()
+        for k in 0..n
+            let _ = buf.push((k + 1) as i32)
+        n
+
+    fn xruns(self) -> Int [hw]
+        self.lost
+
+// The async form is a type of its own, for the reason `AsyncLink` gives.
+struct AsyncMics
+    running: Bool
+
+impl PdmInAsync for AsyncMics
+    async fn receive(self, n: Int) -> [i32] [hw]
+        var out: [i32] = []
+        if not self.running
+            return out
+        for k in 0..n
+            list.push(out, (k + 1) as i32)
+        out
+
+fn pdm(clock: Int, rate: Int, channels: Int) -> PdmConfig
+    PdmConfig { clock_hz: clock,
+        sample_rate: rate,
+        channels: channels,
+        edge: PdmEdge.PdmLeftFalling }
+
+// A capture written against the trait: configure, start, receive, stop.
+fn capture<P: PdmIn>(p: P, c: PdmConfig, n: Int) -> Int [hw]
+    if not p.configure(c)
+        return -1
+    if not p.enable()
+        return -1
+    var buf: Vec[i32; 256] = Vec.new()
+    let got = p.receive(var buf, n)
+    p.disable()
+    got
+
+@test
+fn test_a_capture_runs_through_the_trait() [io, hw]
+    let m = Mics { taken: 16000, running: true, lost: 2 }
+    test.assert(capture(m, pdm(1024000, 16000, 2), 64) == 64)
+    test.assert(m.sample_rate() == 16000)
+    test.assert(m.xruns() == 2)
+    // A ratio the peripheral does not have, and one that is no whole number.
+    test.assert(capture(m, pdm(1280000, 16000, 2), 64) == -1)
+    test.assert(capture(m, pdm(1000000, 16000, 2), 64) == -1)
+    // A peripheral that never took a rate cannot be enabled, and a
+    // stopped one refuses the receive.
+    test.assert(capture(Mics { taken: 0, running: false, lost: 0 }, pdm(1024000, 16000, 1), 8) == -1)
+    var buf: Vec[i32; 256] = Vec.new()
+    test.assert(Mics { taken: 16000, running: false, lost: 0 }.receive(var buf, 8) == -1)
+    test.assert(m.receive(var buf, 300) == -1)
+    test.assert(m.receive(var buf, -1) == -1)
+
+@test
+fn test_the_async_form_receives_a_list() [io, hw, async]
+    let m = AsyncMics { running: true }
+    let got = await m.receive(5)
+    test.assert(got.len() == 5)
+    test.assert((got[4] as Int) == 5)
+    let none = await AsyncMics { running: false }.receive(5)
+    test.assert(none.len() == 0)
+
+@test
+fn test_pdm_settings_need_a_whole_decimation_and_one_or_two_channels() [io]
+    test.assert(embedded_hal.pdm_config_valid(pdm(1024000, 16000, 1)))
+    test.assert(embedded_hal.pdm_config_valid(pdm(3072000, 48000, 2)))
+    test.assert(not embedded_hal.pdm_config_valid(pdm(1000000, 16000, 1)))
+    test.assert(not embedded_hal.pdm_config_valid(pdm(1024000, 16000, 0)))
+    test.assert(not embedded_hal.pdm_config_valid(pdm(1024000, 16000, 3)))
+    test.assert(not embedded_hal.pdm_config_valid(pdm(0, 16000, 1)))
+    test.assert(not embedded_hal.pdm_config_valid(pdm(1024000, 0, 1)))
+
+@test
+fn test_the_decimation_is_the_clock_over_the_rate() [io]
+    test.assert(embedded_hal.pdm_decimation(pdm(1024000, 16000, 1)) == 64)
+    test.assert(embedded_hal.pdm_decimation(pdm(3072000, 48000, 2)) == 64)
+    test.assert(embedded_hal.pdm_decimation(pdm(2400000, 30000, 1)) == 80)
+    test.assert(embedded_hal.pdm_decimation(pdm(1000000, 16000, 1)) == 0)
+    // The edge only names which channel is which.
+    let rising = PdmConfig { clock_hz: 1024000, sample_rate: 16000, channels: 2, edge: PdmEdge.PdmLeftRising }
+    test.assert(embedded_hal.pdm_decimation(rising) == 64)

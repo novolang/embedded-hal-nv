@@ -5,6 +5,40 @@ All notable changes to embedded-hal-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.3.3 — 2026-11-10
+
+An I2S interface and a PDM input, for the codecs, digital microphones
+and amplifiers whose drivers need an audio data path.  Additive: no
+signature of 0.3.2 changed, and the toolchain floor stays 0.19.4.
+
+### Added
+
+- **`I2s`**, a trait for an I2S interface: `configure(I2sConfig)` answers
+  whether the peripheral took the sample rate, bit depth (8, 16, 24 or
+  32), channels (1 or 2), role and framing; `sample_rate()` reads back the
+  rate the dividers gave; `enable()` and `disable()` start and stop the
+  clocks; `transmit(var buf)` and `receive(var buf, n)` move samples
+  through a `Vec[i32; 256]` the caller owns and answer the count, or -1
+  when refused; `xruns()` counts the buffers lost to an underrun or an
+  overrun.  `I2sAsync` is the `async fn` form for a host's scheduler.
+- **`PdmIn`**, a trait for a PDM microphone input that hands back 16-bit
+  PCM samples: `configure(PdmConfig)`, `sample_rate()`, `enable()`,
+  `disable()`, `receive(var buf, n)` and `xruns()`.  `PdmInAsync` is its
+  `async fn` form.
+- `I2sConfig` with `I2sRole` (`I2sMaster`, `I2sSlave`) and `I2sFormat`
+  (`I2sPhilips`, `I2sLeftJustified`); `PdmConfig` with `PdmEdge`
+  (`PdmLeftFalling`, `PdmLeftRising`); `I2S_BUFFER_SAMPLES`, 256.
+- `i2s_config_valid`, `i2s_bclk_hz`, `pdm_config_valid` and
+  `pdm_decimation`: the arithmetic of the settings.
+- `tests/i2s_tests.nv`, with a stereo link and a pair of PDM microphones
+  for doubles and a speaker driver, a recorder and a capture written
+  against the traits.
+
+No board implements either trait: the traits have no bodies and there is
+no `BoardI2s` handle, because no `hal.i2s` hook exists.  The hook, the pin
+maps and the master clock are the board support packages' next step.  The
+README names the chips' I2S and PDM blocks that were read for the shape.
+
 ## 0.3.2 — 2026-10-08
 
 The toolchain floor is 0.19.4, which carries `hal.watchdog`; 0.3.1 named
