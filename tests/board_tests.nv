@@ -92,6 +92,17 @@ fn test_board_gpio_uart_and_timer_reach_their_hooks() [io, hw]
     test.assert(t.ticks_ms() >= 0)
     test.assert(t.ticks_us() >= 0)
 
+// A bus waits on the board's timer: the bodies of `delay_us` and
+// `delay_ms` reach `hal.timer` as `Timer`'s do.
+@test
+fn test_the_buses_wait_on_the_boards_timer() [io, hw]
+    let i2c = BoardI2c { id: 0 }
+    i2c.delay_us(1)
+    i2c.delay_ms(1)
+    let spi = BoardSpi { id: 0 }
+    spi.delay_us(1)
+    spi.delay_ms(1)
+
 // ── A source of a program's own ──────────────────────────────────────
 
 // A byte source over a fixed number: each arm resolves the caller's

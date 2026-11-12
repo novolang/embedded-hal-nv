@@ -97,6 +97,51 @@ fn test_board_can_reaches_the_hook() [io, hw]
     let e = can.errors()
     test.assert(e.tx == 0 and e.rx == 0 and e.state == embedded_hal.CAN_ERROR_ACTIVE)
 
+// The methods of a controller with more than classic frames take their
+// bodies on a host, and on a board whose on-chip controller has none of
+// them: FD, filters and flags are refused, a priority falls back to the
+// plain send, and no reason is recorded.
+@test
+fn test_board_can_refuses_what_the_hook_does_not_have() [io, hw]
+    let can = BoardCan { id: 0 }
+    test.assert(not can.open_fd(500000, 2000000, embedded_hal.CAN_MODE_NORMAL))
+    let fd = embedded_hal.CanBusFdFrame { id: 1, extended: false, brs: true, esi: false, len: 12 }
+    var data: Vec[u8; 64] = Vec.new()
+    let _ = data.push(7 as u8)
+    test.assert(not can.send_fd(fd, data))
+    test.assert(can.receive_fd(var data) == None)
+    test.assert(data.len() == 0)
+    test.assert(not can.set_filter(0, 0x123, 0x7FF, false))
+    test.assert(not can.clear_filter(0))
+    test.assert(not can.send_priority(embedded_hal.can_data(0x123, 1, 7), 3))
+    test.assert(can.interrupt_flags() == 0)
+    test.assert(not can.clear_interrupt_flags(embedded_hal.CAN_INT_RX))
+    test.assert(can.open_error() == embedded_hal.CAN_OPEN_OK)
+
+// ── The FD frame ─────────────────────────────────────────────────────
+
+@test
+fn test_an_fd_length_is_one_a_data_length_code_names() [io]
+    for n in 0..9
+        test.assert(embedded_hal.can_fd_len_valid(n))
+    for n in [12, 16, 20, 24, 32, 48, 64]
+        test.assert(embedded_hal.can_fd_len_valid(n))
+    for n in [-1, 9, 11, 13, 25, 33, 49, 63, 65]
+        test.assert(not embedded_hal.can_fd_len_valid(n))
+
+@test
+fn test_an_fd_frame_is_valid_by_its_identifier_width_and_length() [io]
+    let ok = embedded_hal.CanBusFdFrame { id: 0x7FF, extended: false, brs: true, esi: false, len: 64 }
+    test.assert(embedded_hal.can_fd_frame_valid(ok))
+    let wide = embedded_hal.CanBusFdFrame { id: 0x1FFFFFFF, extended: true, brs: false, esi: false, len: 12 }
+    test.assert(embedded_hal.can_fd_frame_valid(wide))
+    let too_wide = embedded_hal.CanBusFdFrame { id: 0x800, extended: false, brs: false, esi: false, len: 8 }
+    test.assert(not embedded_hal.can_fd_frame_valid(too_wide))
+    let negative = embedded_hal.CanBusFdFrame { id: -1, extended: false, brs: false, esi: false, len: 8 }
+    test.assert(not embedded_hal.can_fd_frame_valid(negative))
+    let odd = embedded_hal.CanBusFdFrame { id: 1, extended: false, brs: false, esi: false, len: 9 }
+    test.assert(not embedded_hal.can_fd_frame_valid(odd))
+
 // ── A bus of a program's own ─────────────────────────────────────────
 
 // A bus that always holds one frame, given as the header and data words
@@ -152,3 +197,102 @@ fn test_a_bus_of_a_program_s_own_carries_a_frame() [io, hw]
     test.assert(echo(bus, embedded_hal.can_data(0x800, 0, 0)) == None)
     test.assert(echo(Held { header: -1, data: 0, rate: 0 }, sent) == None)
     test.assert(bus.errors().state == embedded_hal.CAN_ERROR_PASSIVE)
+
+// ── A controller with FD, filters and flags ──────────────────────────
+
+// A controller of a program's own that has the FD and the filter
+// methods: it receives one FD frame of 12 bytes, takes eight filters,
+// has a receive flag and an overflow flag pending, and records why it
+// refused the last open.  It writes the classic methods too, with
+// nothing behind them.
+@value
+struct Fd
+    reason: Int
+
+impl CanBus for Fd
+    fn open(self, bitrate: Int, mode: Int) -> Bool [hw]
+        bitrate == 500000
+
+    fn send(self, f: CanBusFrame) -> Bool [hw]
+        embedded_hal.can_frame_valid(f)
+
+    fn receive(self) -> ?CanBusFrame [hw]
+        None
+
+    fn tx_done(self) -> Bool [hw]
+        true
+
+    fn bitrate(self) -> Int [hw]
+        500000
+
+    fn errors(self) -> CanBusErrors [hw]
+        embedded_hal.can_errors_of(0)
+
+    fn open_fd(self, nominal_bps: Int, data_bps: Int, mode: Int) -> Bool [hw]
+        nominal_bps == 500000 and data_bps >= nominal_bps
+
+    fn send_fd(self, f: CanBusFdFrame, data: Vec[u8; 64]) -> Bool [hw]
+        embedded_hal.can_fd_frame_valid(f) and data.len() == f.len
+
+    fn receive_fd(self, var data: Vec[u8; 64]) -> ?CanBusFdFrame [hw]
+        data.clear()
+        for i in 0..12
+            let _ = data.push((i + 1) as u8)
+        Some(CanBusFdFrame { id: 0x55, extended: false, brs: true, esi: false, len: 12 })
+
+    fn set_filter(self, n: Int, id: Int, mask: Int, extended: Bool) -> Bool [hw]
+        n >= 0 and n < 8
+
+    fn clear_filter(self, n: Int) -> Bool [hw]
+        n >= 0 and n < 8
+
+    fn send_priority(self, f: CanBusFrame, priority: Int) -> Bool [hw]
+        priority >= 0 and priority < 32 and self.send(f)
+
+    fn interrupt_flags(self) -> Int [hw]
+        embedded_hal.CAN_INT_RX | embedded_hal.CAN_INT_OVERFLOW
+
+    fn clear_interrupt_flags(self, mask: Int) -> Bool [hw]
+        mask != 0
+
+    fn open_error(self) -> Int [hw]
+        self.reason
+
+// Opens for FD, sends a 12-byte frame and receives the controller's.
+fn fd_round<B: CanBus>(bus: B) -> Int [hw]
+    if not bus.open_fd(500000, 2000000, embedded_hal.CAN_MODE_NORMAL)
+        return -1
+    var data: Vec[u8; 64] = Vec.new()
+    for i in 0..12
+        let _ = data.push(i as u8)
+    let f = CanBusFdFrame { id: 1, extended: false, brs: true, esi: false, len: 12 }
+    if not bus.send_fd(f, data)
+        return -2
+    match bus.receive_fd(var data)
+        Some(r) => r.len + data[11] as Int * 100
+        None    => -3
+
+@test
+fn test_a_controller_with_fd_sends_and_receives_through_the_trait() [io, hw]
+    test.assert(fd_round(Fd { reason: 0 }) == 12 + 12 * 100)
+
+@test
+fn test_a_controller_with_filters_and_flags_answers_them() [io, hw]
+    let bus = Fd { reason: embedded_hal.CAN_OPEN_RATE }
+    test.assert(bus.set_filter(7, 0x123, 0x7FF, false))
+    test.assert(not bus.set_filter(8, 0x123, 0x7FF, false))
+    test.assert(bus.clear_filter(0))
+    test.assert(bus.send_priority(embedded_hal.can_data(1, 1, 1), 31))
+    test.assert(not bus.send_priority(embedded_hal.can_data(1, 1, 1), 32))
+    test.assert((bus.interrupt_flags() & embedded_hal.CAN_INT_RX) != 0)
+    test.assert((bus.interrupt_flags() & embedded_hal.CAN_INT_TX) == 0)
+    test.assert(bus.clear_interrupt_flags(embedded_hal.CAN_INT_OVERFLOW))
+    test.assert(bus.open_error() == embedded_hal.CAN_OPEN_RATE)
+    test.assert(embedded_hal.CAN_INT_BUS_OFF == 16 and embedded_hal.CAN_INT_ERROR == 4)
+    test.assert(embedded_hal.CAN_OPEN_MODE == 2 and embedded_hal.CAN_OPEN_NO_CONTROLLER == 3)
+    test.assert(embedded_hal.CAN_OPEN_NOT_READY == 4)
+    // The classic methods are the controller's own.
+    test.assert(bus.open(500000, 0) and not bus.open(250000, 0))
+    test.assert(bus.send(embedded_hal.can_data(1, 1, 1)))
+    test.assert(bus.receive() == None and bus.tx_done() and bus.bitrate() == 500000)
+    test.assert(bus.errors().state == embedded_hal.CAN_ERROR_ACTIVE)

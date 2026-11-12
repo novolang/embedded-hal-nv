@@ -227,6 +227,18 @@ pub trait SpiBus
     fn read(self, n: Int) -> [u8] [hw]
         hal.spi.read(n)
 
+    // Waits `us` microseconds, on the board's timer 0 as `Timer.delay_us`
+    // does.  A driver written over this bus waits for its part without a
+    // second handle: a part that needs a settling time after a command, or
+    // a wait between two transactions, takes it from the bus it holds.  A
+    // bus of a test's own overrides it to record the wait.
+    fn delay_us(self, us: Int) [hw]
+        hal.timer.delay_us(us)
+
+    // Waits `ms` milliseconds; see `delay_us`.
+    fn delay_ms(self, ms: Int) [hw]
+        hal.timer.delay_ms(ms)
+
 // `transfer_buf` sends `tx` and returns the bytes received while it
 // was sent, one for each.
 pub trait SpiBusAsync
@@ -271,6 +283,20 @@ pub trait I2cBus
             Some(buf) => Some(buf[0] as Int)
             None      => None
 
+    // Waits `us` microseconds, on the board's timer 0 as `Timer.delay_us`
+    // does.  A driver written over this bus waits for its part without a
+    // second handle.  Rust's `embedded-hal` keeps the delay in a trait of
+    // its own, `DelayNs`, which a driver takes beside the bus; here the
+    // board has one timer for delays and the bus reaches it, so the
+    // device table's `attach(bus, pins, w)` needs no timer slot.  A bus of
+    // a test's own overrides the method to record the wait.
+    fn delay_us(self, us: Int) [hw]
+        hal.timer.delay_us(us)
+
+    // Waits `ms` milliseconds; see `delay_us`.
+    fn delay_ms(self, ms: Int) [hw]
+        hal.timer.delay_ms(ms)
+
 // The I2C bus's transactions, each parking the task until the bus
 // completes it.
 pub trait I2cBusAsync
@@ -286,8 +312,8 @@ pub trait I2cBusAsync
 // `len` is the data length, 0 to 8; a remote frame's `len` is the
 // length it asks for.  `data` holds the bytes, byte 0 in bits 0 to 7
 // and byte 7 in bits 56 to 63, so a frame is a value of five words with
-// no list.  CAN FD, whose frames carry up to 64 bytes, is not here; it
-// would be a trait of its own beside this one.
+// no list.  CAN FD, whose frames carry up to 64 bytes, has
+// `CanBusFdFrame` and the FD methods of `CanBus`.
 pub @value
 struct CanBusFrame
     id: Int
@@ -295,6 +321,23 @@ struct CanBusFrame
     remote: Bool
     len: Int
     data: Int
+
+// The header of a CAN FD frame (ISO 11898-1:2015): an identifier of 11
+// bits, or of 29 with `extended`, a data length of 0 to 64 bytes that
+// is one of the lengths a data length code names (0 to 8, 12, 16, 20,
+// 24, 32, 48 and 64), `brs` for a frame whose data phase runs at the
+// faster data bit rate, and `esi` for a frame sent by a node in error
+// passive state.  A remote frame does not exist in FD.  The bytes
+// travel beside the header in a `Vec[u8; 64]` the caller owns, so a frame
+// is a value of five words and the buffer stays where the caller, or a
+// DMA region, has it.
+pub @value
+struct CanBusFdFrame
+    id: Int
+    extended: Bool
+    brs: Bool
+    esi: Bool
+    len: Int
 
 // The controller's error counters and its fault confinement state
 // (ISO 11898-1, clause 12): `tx` and `rx` are the transmit and receive
@@ -325,6 +368,42 @@ pub const CAN_ERROR_PASSIVE = 1
 // `CanBusErrors.state` of a node whose transmit counter passed 255,
 // off the bus until it recovers.
 pub const CAN_BUS_OFF = 2
+
+// `CanBus.interrupt_flags` bit: a frame waits in the receive FIFO.
+pub const CAN_INT_RX = 1
+
+// `CanBus.interrupt_flags` bit: a frame has left the transmit queue.
+pub const CAN_INT_TX = 2
+
+// `CanBus.interrupt_flags` bit: an error counter changed state or a bus
+// error was seen.
+pub const CAN_INT_ERROR = 4
+
+// `CanBus.interrupt_flags` bit: a receive FIFO lost a frame because it
+// was full.
+pub const CAN_INT_OVERFLOW = 8
+
+// `CanBus.interrupt_flags` bit: the node went bus-off.
+pub const CAN_INT_BUS_OFF = 16
+
+// `CanBus.open_error` value: the last `open` was taken, or the
+// controller records no reason.
+pub const CAN_OPEN_OK = 0
+
+// `CanBus.open_error` value: the bit rate is one the controller's clock
+// cannot make.
+pub const CAN_OPEN_RATE = 1
+
+// `CanBus.open_error` value: the mode is one the controller does not
+// have.
+pub const CAN_OPEN_MODE = 2
+
+// `CanBus.open_error` value: the controller did not answer.
+pub const CAN_OPEN_NO_CONTROLLER = 3
+
+// `CanBus.open_error` value: the controller answered and did not leave
+// its configuration mode.
+pub const CAN_OPEN_NOT_READY = 4
 
 // A CAN controller, classic frames only.  `open` starts the controller
 // at `bitrate` bits a second in `mode` and answers whether it took
@@ -368,6 +447,66 @@ pub trait CanBus
     fn errors(self) -> CanBusErrors [hw]
         can_errors_of(hal.can.errors())
 
+    // The methods below are for a controller that has more than the
+    // classic frame and one filter.  The bodies answer for a controller
+    // without the feature, which is what `hal.can` is today: a board's
+    // on-chip controller refuses them, and a driver for an external
+    // controller overrides the ones its part has.
+
+    // Opens the controller for CAN FD at `nominal_bps` for the
+    // arbitration phase and `data_bps` for the data phase of a frame
+    // with `brs`, in `mode`, and answers whether it took them.  Refused
+    // by a controller without FD.
+    fn open_fd(self, nominal_bps: Int, data_bps: Int, mode: Int) -> Bool [hw]
+        false
+
+    // Hands an FD frame and its `f.len` bytes to the controller and
+    // answers whether it took it.  A frame that `can_fd_frame_valid`
+    // refuses is not sent.
+    fn send_fd(self, f: CanBusFdFrame, data: Vec[u8; 64]) -> Bool [hw]
+        false
+
+    // The next FD frame received, with its bytes in `data`, or `None` at
+    // once when none waits.  `data` is emptied first.
+    fn receive_fd(self, var data: Vec[u8; 64]) -> ?CanBusFdFrame [hw]
+        data.clear()
+        None
+
+    // Sets acceptance filter `n` to pass the frames whose identifier
+    // matches `id` in the bits `mask` selects, with the identifier width
+    // `extended`, and answers whether the controller took it.  A
+    // controller with no filters passes every frame and refuses this.
+    fn set_filter(self, n: Int, id: Int, mask: Int, extended: Bool) -> Bool [hw]
+        false
+
+    // Disables filter `n`; answers whether the controller did.
+    fn clear_filter(self, n: Int) -> Bool [hw]
+        false
+
+    // Queues a classic frame with a transmit priority, 0 the lowest.  A
+    // controller whose transmit buffers have priorities, the MCP2515's
+    // and MCP2518FD's, sends the frame of the highest priority first; one
+    // without them sends in the order of `send`, which is what this body
+    // does.
+    fn send_priority(self, f: CanBusFrame, priority: Int) -> Bool [hw]
+        self.send(f)
+
+    // The `CAN_INT_*` bits of the events the controller has recorded and
+    // the program has not cleared; 0 for a controller that records none.
+    fn interrupt_flags(self) -> Int [hw]
+        0
+
+    // Clears the bits of `mask` from the interrupt flags; answers whether
+    // the controller did.
+    fn clear_interrupt_flags(self, mask: Int) -> Bool [hw]
+        false
+
+    // Why the last `open` or `open_fd` was refused, as a `CAN_OPEN_*`
+    // value: `CAN_OPEN_OK` when it was taken and for a controller that
+    // records no reason.
+    fn open_error(self) -> Int [hw]
+        CAN_OPEN_OK
+
 // A data frame with an 11-bit identifier: `len` bytes of `data`, byte 0
 // in its low bits.
 //
@@ -394,6 +533,22 @@ pub fn can_byte(f: CanBusFrame, i: Int) -> Int
     if i < 0 or i >= f.len or f.remote
         return 0
     int.shr_logical(f.data, i * 8) & 0xFF
+
+// Whether a data length is one a CAN FD frame can carry: 0 to 8, 12, 16,
+// 20, 24, 32, 48 or 64.  The other lengths have no data length code.
+pub fn can_fd_len_valid(len: Int) -> Bool
+    if len >= 0 and len <= 8
+        return true
+    len == 12 or len == 16 or len == 20 or len == 24 or len == 32 or len == 48 or len == 64
+
+// Whether a bus carries the FD frame: the identifier fits its width and
+// the length is one `can_fd_len_valid` names.
+pub fn can_fd_frame_valid(f: CanBusFdFrame) -> Bool
+    let top = if f.extended
+        0x1FFFFFFF
+    else
+        0x7FF
+    f.id >= 0 and f.id <= top and can_fd_len_valid(f.len)
 
 // Whether a bus carries the frame: the identifier fits its width and
 // the length is 0 to 8.
@@ -524,21 +679,36 @@ enum I2sRole
 // How a frame is laid out on the data line.  `I2sPhilips` is the I2S
 // standard of Philips (NXP): the word clock changes one bit clock
 // before the first bit of a word.  `I2sLeftJustified` starts the first
-// bit with the word clock's edge.  Most codecs and microphones take
-// either; the two sides must agree.
+// bit with the word clock's edge.  `I2sRightJustified` ends the last
+// bit with the word clock's next edge, so a sample shorter than its slot
+// (`I2sConfig.slot_bits`) sits at the end of the slot.  `I2sDspA` and
+// `I2sDspB` are the PCM or DSP forms: the word clock is a pulse one bit
+// clock long that marks the start of the frame, the channels follow one
+// another with no gap, and the first bit follows the pulse after one bit
+// clock in A and with none in B.  Most codecs and microphones take
+// several of them; the two sides must agree.
 pub @value
 enum I2sFormat
     I2sPhilips
     I2sLeftJustified
+    I2sRightJustified
+    I2sDspA
+    I2sDspB
 
 // The settings of one I2S interface.  `sample_rate` is the word clock
 // in hertz, one frame per period; `bit_depth` is the bits of a sample,
 // 8, 16, 24 or 32; `channels` is the samples of a frame, 1 or 2.
+// `slot_bits` is the bit clocks one channel's slot takes on the wire,
+// which a codec may want wider than the sample: 24 bits in a slot of 32,
+// or 16 bits in a slot of 32 for a part that counts 64 clocks to a
+// frame.  0 means the slot is as wide as the sample.  The samples in the
+// buffers keep `bit_depth` bits whatever the slot is.
 pub @value
 struct I2sConfig
     sample_rate: Int
     bit_depth: Int
     channels: Int
+    slot_bits: Int
     role: I2sRole
     format: I2sFormat
 
@@ -651,56 +821,91 @@ pub trait PdmIn
     fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
     fn xruns(self) -> Int [hw]
 
+    // Sets the gain the peripheral applies to the PCM samples, in
+    // thousandths of a decibel (0 leaves the level as it is), to the
+    // largest step the peripheral has at or below `mdb` and, when `mdb`
+    // is below its smallest, to that step.  Answers the gain it set, or
+    // `None` for a peripheral with no gain stage, which is what this
+    // body answers.  The nRF52840's PDM block has one, in half-decibel
+    // steps from -20 to +20 dB.
+    fn set_gain(self, mdb: Int) -> ?Int [hw]
+        None
+
 // The PDM input on a host's scheduler: `receive` parks the task until
 // `n` samples have arrived and answers them.
 pub trait PdmInAsync
     async fn receive(self, n: Int) -> [i32] [hw]
 
 // Whether an I2S interface can be asked for these settings: a positive
-// rate, a depth of 8, 16, 24 or 32 bits, and 1 or 2 channels.  An
-// implementation refuses the settings this refuses, and may refuse more.
+// rate, a depth of 8, 16, 24 or 32 bits, 1 or 2 channels, and a slot of
+// 0 (as wide as the sample) or at least the depth and at most 64 bits.
+// An implementation refuses the settings this refuses, and may refuse
+// more.
 //
 // ```novo
 // use embedded_hal.{ I2sConfig, I2sRole, I2sFormat }
 //
 // fn main() [io]
-//     let c = I2sConfig { sample_rate: 48000, bit_depth: 24, channels: 2,
+//     let c = I2sConfig { sample_rate: 48000, bit_depth: 24, channels: 2, slot_bits: 32,
 //                         role: I2sRole.I2sMaster, format: I2sFormat.I2sPhilips }
 //     println("${embedded_hal.i2s_config_valid(c)}")   // true
-//     println("${embedded_hal.i2s_bclk_hz(c)}")        // 2304000
+//     println("${embedded_hal.i2s_bclk_hz(c)}")        // 3072000
 // ```
 pub fn i2s_config_valid(c: I2sConfig) -> Bool
     let depth_ok = c.bit_depth == 8 or c.bit_depth == 16 or c.bit_depth == 24 or c.bit_depth == 32
-    c.sample_rate > 0 and depth_ok and (c.channels == 1 or c.channels == 2)
+    let slot_ok = c.slot_bits == 0 or c.slot_bits >= c.bit_depth and c.slot_bits <= 64
+    c.sample_rate > 0 and depth_ok and (c.channels == 1 or c.channels == 2) and slot_ok
+
+// The bit clocks of one channel's slot: `slot_bits`, or the sample's
+// `bit_depth` when `slot_bits` is 0.
+pub fn i2s_slot_bits(c: I2sConfig) -> Int
+    if c.slot_bits == 0
+        return c.bit_depth
+    c.slot_bits
 
 // The bit clock the settings imply, in hertz: the word clock times the
-// bits of a frame.  A master drives it, a slave must be given it.
+// bit clocks of a frame, the slot of each channel.  A master drives it, a
+// slave must be given it.
 pub fn i2s_bclk_hz(c: I2sConfig) -> Int
-    c.sample_rate * c.bit_depth * c.channels
+    c.sample_rate * i2s_slot_bits(c) * c.channels
 
-// Whether a PDM input can be asked for these settings: positive clock
-// and rate with the clock a whole multiple of the rate, and 1 or 2
-// channels.
+// Whether a PDM input can be asked for these settings: a positive clock
+// and rate, the clock at least twice the rate, and 1 or 2 channels.  The
+// clock need not be a whole multiple of the rate: the peripheral takes
+// the decimation it has at or below the ratio and `PdmIn.sample_rate`
+// reads back the rate that gives, as `I2s.sample_rate` does for the word
+// clock.  An nRF52840 asked for 16 kHz from a 1.032 MHz clock runs at
+// 16.125 kHz.
 pub fn pdm_config_valid(c: PdmConfig) -> Bool
-    c.clock_hz > 0 and c.sample_rate > 0 and c.clock_hz % c.sample_rate == 0
+    c.clock_hz > 0 and c.sample_rate > 0 and c.clock_hz >= 2 * c.sample_rate
         and (c.channels == 1 or c.channels == 2)
 
 // The decimation ratio of the settings: how many microphone bits one
-// PCM sample is made from, the clock divided by the rate.  0 for
-// settings `pdm_config_valid` refuses.
+// PCM sample is made from, the clock divided by the rate and rounded
+// down, so the rate it gives is at or above the request.  0 for settings
+// `pdm_config_valid` refuses.
 //
 // ```novo
 // use embedded_hal.{ PdmConfig, PdmEdge }
 //
 // fn main() [io]
-//     let c = PdmConfig { clock_hz: 1024000, sample_rate: 16000, channels: 1,
+//     let c = PdmConfig { clock_hz: 1032000, sample_rate: 16000, channels: 1,
 //                         edge: PdmEdge.PdmLeftFalling }
-//     println("${embedded_hal.pdm_decimation(c)}")   // 64
+//     println("${embedded_hal.pdm_decimation(c)}")        // 64
+//     println("${embedded_hal.pdm_rate_hz(c)}")           // 16125
 // ```
 pub fn pdm_decimation(c: PdmConfig) -> Int
     if not pdm_config_valid(c)
         return 0
     c.clock_hz / c.sample_rate
+
+// The rate of the PCM samples the settings give: the clock over
+// `pdm_decimation`.  0 for settings `pdm_config_valid` refuses.
+pub fn pdm_rate_hz(c: PdmConfig) -> Int
+    let d = pdm_decimation(c)
+    if d == 0
+        return 0
+    c.clock_hz / d
 
 // ── ADC ──────────────────────────────────────────────────────────────
 

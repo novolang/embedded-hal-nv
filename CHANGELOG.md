@@ -5,6 +5,62 @@ All notable changes to embedded-hal-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.4.0 — 2026-11-12
+
+The gaps the two driver rounds of 2026-11-10 and 2026-11-11 found in the
+audio data path, the buses and the CAN trait.  The record `I2sConfig`
+gains a field, so this is the breaking kind of minor.  The toolchain
+floor stays 0.19.4.
+
+### Breaking
+
+- **`I2sConfig` gains `slot_bits: Int`**, the bit clocks of one channel's
+  slot, 0 for a slot as wide as the sample.  A record literal adds
+  `slot_bits: 0` to keep 0.3.3's meaning.  `i2s_bclk_hz` counts the slot
+  (`i2s_slot_bits`), and `i2s_config_valid` refuses a slot narrower than
+  the sample or wider than 64.
+- **`I2sFormat` gains `I2sRightJustified`, `I2sDspA` and `I2sDspB`.**  A
+  `match` on `I2sFormat` with no wildcard adds the three arms.
+- **`pdm_config_valid` accepts a clock that is not a whole multiple of the
+  rate**, so long as it is at least twice the rate; 0.3.3 refused it.
+  `pdm_decimation` rounds the ratio down.  An implementation of `PdmIn`
+  that relied on the validator to refuse a non-integer ratio checks it in
+  its `configure`.
+
+### Added
+
+- `I2cBus.delay_us` and `delay_ms`, and `SpiBus.delay_us` and `delay_ms`,
+  with bodies that call `hal.timer`, so a driver written over a bus waits
+  for its part without a second handle.  Rust's `embedded-hal` keeps the
+  delay in a trait of its own, `DelayNs`; the shape here follows that
+  trait's `delay_us` and `delay_ms`, on the bus because the board has one
+  timer for delays and the device table's `attach(bus, pins, w)` has no
+  slot for another.
+- `PdmIn.set_gain(mdb)`, a body that answers `None`, for a peripheral with
+  a gain stage; `pdm_rate_hz`, the rate a clock and a rate give.
+- `i2s_slot_bits`.
+- `CanBusFdFrame` and `can_fd_len_valid`, `can_fd_frame_valid`; the
+  `CanBus` methods `open_fd`, `send_fd`, `receive_fd`, `set_filter`,
+  `clear_filter`, `send_priority`, `interrupt_flags`,
+  `clear_interrupt_flags` and `open_error`, each with a body that answers
+  for a controller without the feature (a refusal, `None`, 0, or for
+  `send_priority` the plain `send`), so a board's on-chip controller and
+  every existing implementation build unchanged.  The constants
+  `CAN_INT_RX`, `CAN_INT_TX`, `CAN_INT_ERROR`, `CAN_INT_OVERFLOW`,
+  `CAN_INT_BUS_OFF` and `CAN_OPEN_OK`, `CAN_OPEN_RATE`, `CAN_OPEN_MODE`,
+  `CAN_OPEN_NO_CONTROLLER`, `CAN_OPEN_NOT_READY`.  The FD frame keeps its
+  bytes in a `Vec[u8; 64]` beside the header, the shape `can-nv` gives the
+  header, so no allocation and no dependency.
+- Tests for each, in `tests/i2s_tests.nv`, `tests/can_tests.nv` and
+  `tests/board_tests.nv`.
+
+### Not here
+
+No board implements `I2s`, `PdmIn` or the CAN FD methods: the hooks they
+would forward to belong to the board support packages and the toolchain.
+The sampling edge of the SPH0645's data timing is not in `I2sConfig`,
+since no driver has needed it.
+
 ## 0.3.3 — 2026-11-10
 
 An I2S interface and a PDM input, for the codecs, digital microphones

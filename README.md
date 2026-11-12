@@ -101,7 +101,7 @@ fn main() [hw]
 
 | Module | What is in it |
 | --- | --- |
-| `embedded_hal` | The seven board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, the sync trait for CAN with its frame, `CanBusFrame`, and its counters, `CanBusErrors`, and the sync trait for the watchdog, `Watchdog`, with `reset_reason()` and its `RESET_*` values; the traits for an I2S interface and a PDM input, `I2s` and `PdmIn`, with their async forms, their settings and the arithmetic of the settings; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus`, `SpiBus`, `CanBus` and `Watchdog` for the handles. |
+| `embedded_hal` | The seven board handles; the sync and async traits for GPIO, UART, timers, SPI, I2C, ADC, PWM and block storage, the sync trait for CAN with its frames, `CanBusFrame` and `CanBusFdFrame`, and its counters, `CanBusErrors`, and the sync trait for the watchdog, `Watchdog`, with `reset_reason()` and its `RESET_*` values; the traits for an I2S interface and a PDM input, `I2s` and `PdmIn`, with their async forms, their settings and the arithmetic of the settings; the awaitable traits `AsyncRead`, `AsyncDeadline`, `AsyncEdge` and `AsyncBlock`; and the implementation of `GpioOut`, `UartTx`, `UartRx`, `AsyncRead`, `Timer`, `AsyncDeadline`, `I2cBus`, `SpiBus`, `CanBus` and `Watchdog` for the handles. |
 
 | Peripheral | Handle | Sync trait | Async trait | Awaitable trait |
 | --- | --- | --- | --- | --- |
@@ -140,13 +140,14 @@ and the microphone answers one bit per clock, at a density that follows
 the sound, which a filter turns into samples.
 
 `I2s` configures an interface (`I2sConfig`: the sample rate, the bit
-depth, one or two channels, master or slave, and Philips or
-left-justified framing), starts and stops its clocks, and moves samples
+depth, one or two channels, the slot width, master or slave, and the
+framing: Philips, left-justified, right-justified or one of the two
+PCM/DSP forms), starts and stops its clocks, and moves samples
 through a `Vec[i32; 256]` the caller owns and passes as a `var`
 argument, as `BlockDevice` moves a block. `PdmIn` configures a PDM input
 (`PdmConfig`: the clock, the PCM sample rate, the channels and the edge
-the left microphone is read on), starts and stops it, and receives PCM
-samples. Each has an async form for a host's scheduler. A sample is a
+the left microphone is read on), starts and stops it, receives PCM
+samples, and sets the gain of a peripheral that has a gain stage. Each has an async form for a host's scheduler. A sample is a
 signed integer in the low bits of an `Int`, sign-extended, whatever
 alignment the hardware's slot wants; that alignment is the
 implementation's.
@@ -201,7 +202,10 @@ program or a test implements the traits for a type of its own, as
 1. A method's `pin`, `channel`, `block` and `addr` are the hardware's own
    numbers. `GpioOut.mode`'s `dir` is 0 for input, 1 for output, 2 for
    input with pull-up and 3 for input with pull-down.
-2. `Timer.delay_ms` and `delay_us` spin the core for the interval.
+2. `Timer.delay_ms` and `delay_us` spin the core for the interval. So do
+   `I2cBus.delay_ms` and `delay_us` and `SpiBus.delay_ms` and `delay_us`,
+   on the board's timer 0, so that a driver written over a bus waits for
+   its part without a second handle.
    `TimerAsync.sleep_ms` and `AsyncDeadline.after_us_arm` let it sleep.
 3. `UartRx.read_byte` waits until a byte arrives. `try_read_byte`
    answers `None` at once when no byte is waiting.
@@ -212,7 +216,13 @@ program or a test implements the traits for a type of its own, as
    drives around a transfer.
 5. A CAN frame is classic: an identifier of 11 bits, or 29 with
    `extended`, up to 8 data bytes held in one `Int` with byte 0 in bits 0
-   to 7, and the remote flag. `CanBus.send` refuses a frame whose
+   to 7, and the remote flag. A CAN FD frame is a `CanBusFdFrame`, whose
+   header carries the identifier, the flags and a length of 0 to 8, 12,
+   16, 20, 24, 32, 48 or 64, and a `Vec[u8; 64]` beside it that holds the
+   bytes. The FD methods, the filters, the transmit priority, the
+   interrupt flags and `open_error` have bodies that answer for a
+   controller without them; a board's on-chip controller takes the bodies,
+   and a driver for an external controller overrides what its part has. `CanBus.send` refuses a frame whose
    identifier does not fit or whose length is past 8, and a frame while
    the last one still waits for the bus. `CanBus.receive` answers `None`
    at once when no frame waits. `CanBus.open` refuses a bit rate the
@@ -264,7 +274,9 @@ program or a test implements the traits for a type of its own, as
    rate its dividers cannot reach. `sample_rate` reads back the rate the
    peripheral runs at, which the dividers round, and is 0 before a
    configure that was taken. `i2s_config_valid` is the least an interface
-   refuses, and `i2s_bclk_hz` is the bit clock a slave must be given.
+   refuses, and `i2s_bclk_hz` is the bit clock a slave must be given. A
+   slot is `slot_bits` bit clocks wide, or as wide as the sample when it
+   is 0; the buffers keep the sample's `bit_depth` bits whatever the slot.
 14. `transmit` and `receive` answer the samples they moved, or -1 when the
    interface is not configured and enabled, or `n` is past
    `I2S_BUFFER_SAMPLES`. A receive replaces the buffer's contents. A
@@ -273,8 +285,10 @@ program or a test implements the traits for a type of its own, as
    an overrun on a receive.
 15. `PdmIn` hands back 16-bit PCM samples, so the decimation is the
    peripheral's and not the caller's. `configure` answers `false` unless the
-   clock is a whole multiple of the sample rate (`pdm_decimation`) and the
-   peripheral has that ratio. A microphone needs some milliseconds after
+   clock is at least twice the sample rate (`pdm_config_valid`); the clock
+   need not be a whole multiple, since the peripheral takes the decimation
+   it has at or below the ratio (`pdm_decimation`), and `sample_rate`
+   reads back the rate that gives (`pdm_rate_hz` computes it). A microphone needs some milliseconds after
    `enable` before its output is valid; the microphone's driver knows how
    many.
 

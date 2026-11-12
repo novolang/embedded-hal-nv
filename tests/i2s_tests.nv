@@ -87,7 +87,7 @@ impl I2sAsync for AsyncLink
         out
 
 fn stereo(rate: Int, depth: Int) -> I2sConfig
-    I2sConfig { sample_rate: rate, bit_depth: depth, channels: 2,
+    I2sConfig { sample_rate: rate, bit_depth: depth, channels: 2, slot_bits: 0,
                 role: I2sRole.I2sMaster, format: I2sFormat.I2sPhilips }
 
 // A speaker driver written against the trait: it configures the link,
@@ -208,10 +208,10 @@ fn test_valid_settings_are_a_known_depth_and_one_or_two_channels() [io]
     test.assert(embedded_hal.i2s_config_valid(stereo(48000, 32)))
     test.assert(not embedded_hal.i2s_config_valid(stereo(48000, 20)))
     test.assert(not embedded_hal.i2s_config_valid(stereo(-1, 16)))
-    let mono = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 1,
+    let mono = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 1, slot_bits: 0,
                            role: I2sRole.I2sSlave, format: I2sFormat.I2sLeftJustified }
     test.assert(embedded_hal.i2s_config_valid(mono))
-    let three = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 3,
+    let three = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 3, slot_bits: 0,
                             role: I2sRole.I2sSlave, format: I2sFormat.I2sLeftJustified }
     test.assert(not embedded_hal.i2s_config_valid(three))
 
@@ -219,7 +219,7 @@ fn test_valid_settings_are_a_known_depth_and_one_or_two_channels() [io]
 fn test_the_bit_clock_is_rate_times_the_bits_of_a_frame() [io]
     test.assert(embedded_hal.i2s_bclk_hz(stereo(48000, 24)) == 2304000)
     test.assert(embedded_hal.i2s_bclk_hz(stereo(16000, 16)) == 512000)
-    let mono = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 1,
+    let mono = I2sConfig { sample_rate: 16000, bit_depth: 16, channels: 1, slot_bits: 0,
                            role: I2sRole.I2sMaster, format: I2sFormat.I2sPhilips }
     test.assert(embedded_hal.i2s_bclk_hz(mono) == 256000)
 
@@ -293,7 +293,8 @@ fn test_a_capture_runs_through_the_trait() [io, hw]
     test.assert(capture(m, pdm(1024000, 16000, 2), 64) == 64)
     test.assert(m.sample_rate() == 16000)
     test.assert(m.xruns() == 2)
-    // A ratio the peripheral does not have, and one that is no whole number.
+    // A decimation the peripheral does not have (80), and one it rounds
+    // down to 62; this peripheral takes 64 only.
     test.assert(capture(m, pdm(1280000, 16000, 2), 64) == -1)
     test.assert(capture(m, pdm(1000000, 16000, 2), 64) == -1)
     // A peripheral that never took a rate cannot be enabled, and a
@@ -314,10 +315,14 @@ fn test_the_async_form_receives_a_list() [io, hw, async]
     test.assert(none.len() == 0)
 
 @test
-fn test_pdm_settings_need_a_whole_decimation_and_one_or_two_channels() [io]
+fn test_pdm_settings_need_a_clock_over_twice_the_rate_and_one_or_two_channels() [io]
     test.assert(embedded_hal.pdm_config_valid(pdm(1024000, 16000, 1)))
     test.assert(embedded_hal.pdm_config_valid(pdm(3072000, 48000, 2)))
-    test.assert(not embedded_hal.pdm_config_valid(pdm(1000000, 16000, 1)))
+    // The clock need not be a whole multiple of the rate: the nRF52840's
+    // 1.032 MHz asked for 16 kHz is taken, and runs at 16.125 kHz.
+    test.assert(embedded_hal.pdm_config_valid(pdm(1032000, 16000, 1)))
+    test.assert(embedded_hal.pdm_config_valid(pdm(32000, 16000, 1)))
+    test.assert(not embedded_hal.pdm_config_valid(pdm(31999, 16000, 1)))
     test.assert(not embedded_hal.pdm_config_valid(pdm(1024000, 16000, 0)))
     test.assert(not embedded_hal.pdm_config_valid(pdm(1024000, 16000, 3)))
     test.assert(not embedded_hal.pdm_config_valid(pdm(0, 16000, 1)))
@@ -328,7 +333,98 @@ fn test_the_decimation_is_the_clock_over_the_rate() [io]
     test.assert(embedded_hal.pdm_decimation(pdm(1024000, 16000, 1)) == 64)
     test.assert(embedded_hal.pdm_decimation(pdm(3072000, 48000, 2)) == 64)
     test.assert(embedded_hal.pdm_decimation(pdm(2400000, 30000, 1)) == 80)
-    test.assert(embedded_hal.pdm_decimation(pdm(1000000, 16000, 1)) == 0)
+    test.assert(embedded_hal.pdm_decimation(pdm(1000, 16000, 1)) == 0)
+    // A clock that is no multiple of the rate gives the decimation at or
+    // below the ratio, so the rate it gives is at or above the request.
+    test.assert(embedded_hal.pdm_decimation(pdm(1032000, 16000, 1)) == 64)
+    test.assert(embedded_hal.pdm_rate_hz(pdm(1032000, 16000, 1)) == 16125)
+    test.assert(embedded_hal.pdm_rate_hz(pdm(1024000, 16000, 1)) == 16000)
+    test.assert(embedded_hal.pdm_rate_hz(pdm(1000, 16000, 1)) == 0)
     // The edge only names which channel is which.
     let rising = PdmConfig { clock_hz: 1024000, sample_rate: 16000, channels: 2, edge: PdmEdge.PdmLeftRising }
     test.assert(embedded_hal.pdm_decimation(rising) == 64)
+
+// ── Slot width, the other framings, and the PDM gain ─────────────────
+
+fn slotted(depth: Int, slot: Int) -> I2sConfig
+    I2sConfig { sample_rate: 48000, bit_depth: depth, channels: 2, slot_bits: slot,
+                role: I2sRole.I2sSlave, format: I2sFormat.I2sRightJustified }
+
+@test
+fn test_a_slot_is_as_wide_as_the_sample_or_wider_up_to_64_bits() [io]
+    test.assert(embedded_hal.i2s_config_valid(slotted(16, 0)))
+    test.assert(embedded_hal.i2s_config_valid(slotted(16, 16)))
+    test.assert(embedded_hal.i2s_config_valid(slotted(16, 32)))
+    test.assert(embedded_hal.i2s_config_valid(slotted(24, 32)))
+    test.assert(embedded_hal.i2s_config_valid(slotted(32, 64)))
+    // Narrower than the sample, and past 64, are refused.
+    test.assert(not embedded_hal.i2s_config_valid(slotted(24, 16)))
+    test.assert(not embedded_hal.i2s_config_valid(slotted(16, 65)))
+
+@test
+fn test_the_bit_clock_counts_the_slot_not_the_sample() [io]
+    test.assert(embedded_hal.i2s_slot_bits(slotted(16, 0)) == 16)
+    test.assert(embedded_hal.i2s_slot_bits(slotted(16, 32)) == 32)
+    // The ES8388 counts 64 bit clocks to a frame at 16 bits: a slot of 32.
+    test.assert(embedded_hal.i2s_bclk_hz(slotted(16, 32)) == 3072000)
+    test.assert(embedded_hal.i2s_bclk_hz(slotted(16, 0)) == 1536000)
+
+@test
+fn test_the_framings_are_five_distinct_values() [io]
+    test.assert(I2sFormat.I2sRightJustified != I2sFormat.I2sLeftJustified)
+    test.assert(I2sFormat.I2sDspA != I2sFormat.I2sDspB)
+    test.assert(I2sFormat.I2sDspA != I2sFormat.I2sPhilips)
+
+// A PDM input with a gain stage in half-decibel steps from -20 to +20 dB,
+// as the nRF52840's has; the other, `Mics`, has none and takes the body.
+struct GainedMics
+    taken: Int
+
+impl PdmIn for GainedMics
+    fn configure(self, c: PdmConfig) -> Bool [hw]
+        embedded_hal.pdm_config_valid(c)
+
+    fn sample_rate(self) -> Int [hw]
+        self.taken
+
+    fn enable(self) -> Bool [hw]
+        true
+
+    fn disable(self) [hw]
+        pass
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        buf.clear()
+        n
+
+    fn xruns(self) -> Int [hw]
+        0
+
+    fn set_gain(self, mdb: Int) -> ?Int [hw]
+        var g = mdb / 500 * 500
+        if mdb < 0 and mdb % 500 != 0
+            g = g - 500
+        if g < -20000
+            g = -20000
+        if g > 20000
+            g = 20000
+        Some(g)
+
+@test
+fn test_a_pdm_input_without_a_gain_stage_answers_none() [io, hw]
+    test.assert(Mics { taken: 16000, running: true, lost: 0 }.set_gain(6000) == None)
+
+@test
+fn test_a_pdm_gain_is_the_step_at_or_below_the_request() [io, hw]
+    let m = GainedMics { taken: 16000 }
+    test.assert(m.set_gain(6200) == Some(6000))
+    test.assert(m.set_gain(-6200) == Some(-6500))
+    test.assert(m.set_gain(99000) == Some(20000))
+    test.assert(m.set_gain(-99000) == Some(-20000))
+    test.assert(m.set_gain(0) == Some(0))
+    // The unused methods of the stand-in take a call each.
+    test.assert(m.configure(PdmConfig { clock_hz: 1032000, sample_rate: 16000, channels: 1, edge: PdmEdge.PdmLeftFalling }))
+    test.assert(m.sample_rate() == 16000 and m.enable() and m.xruns() == 0)
+    var buf: Vec[i32; 256] = Vec.new()
+    test.assert(m.receive(var buf, 4) == 4)
+    m.disable()
